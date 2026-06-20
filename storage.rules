@@ -1,0 +1,17 @@
+rules_version = '2';
+
+service firebase.storage {
+  match /b/{bucket}/o {
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    match /rooms/{roomId}/uploads/{fileName} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn()
+        && request.resource.size < 100 * 1024 * 1024
+        && request.resource.contentType.matches('image/.*|video/.*');
+      allow update, delete: if false;
+    }
+  }
+}
