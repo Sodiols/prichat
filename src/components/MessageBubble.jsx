@@ -13,7 +13,15 @@ function previewText(message) {
   if (!message) return "";
   if (message.type === "image") return message.text || "Photo";
   if (message.type === "video") return message.text || "Video";
+  if (message.type === "voice") return "Voice message";
   return message.text || "Message";
+}
+
+function formatDuration(seconds) {
+  if (!seconds) return "";
+  const minutes = Math.floor(seconds / 60).toString().padStart(2, "0");
+  const rest = Math.floor(seconds % 60).toString().padStart(2, "0");
+  return `${minutes}:${rest}`;
 }
 
 export default function MessageBubble({
@@ -29,7 +37,7 @@ export default function MessageBubble({
   const time = formatTime(message);
   const wasEdited = !!message.editedAt;
   const senderName = isOwn ? "You" : message.displayName || "Member";
-  const hasMedia = !!message.mediaUrl && ["image", "video"].includes(message.type);
+  const hasMedia = !!message.mediaUrl && ["image", "video", "voice"].includes(message.type);
 
   return (
     <div className={`group flex w-full items-end gap-2 ${isOwn ? "justify-end" : "justify-start"}`}>
@@ -80,7 +88,25 @@ export default function MessageBubble({
               />
             )}
 
-            {message.text && (
+            {message.type === "voice" && message.mediaUrl && (
+              <div className={`mb-2 min-w-[220px] rounded-xl border px-3 py-2 ${
+                isOwn ? "border-bg/20 bg-bg/10" : "border-border bg-bg/70"
+              }`}>
+                <div className="mb-2 flex items-center justify-between gap-3">
+                  <span className={isOwn ? "text-xs font-medium text-bg" : "text-xs font-medium text-textPrimary"}>
+                    Voice message
+                  </span>
+                  {message.durationSeconds ? (
+                    <span className={isOwn ? "text-[11px] text-bg/65" : "text-[11px] text-textSecondary"}>
+                      {formatDuration(message.durationSeconds)}
+                    </span>
+                  ) : null}
+                </div>
+                <audio src={message.mediaUrl} controls preload="metadata" className="h-9 w-full min-w-0" />
+              </div>
+            )}
+
+            {message.text && message.type !== "voice" && (
               <p className={`whitespace-pre-wrap break-words ${hasMedia ? "pr-12" : "pr-10"}`}>{message.text}</p>
             )}
 

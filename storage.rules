@@ -10,7 +10,7 @@ service firebase.storage {
       allow read: if isSignedIn();
       allow create: if isSignedIn()
         && request.resource.size < 100 * 1024 * 1024
-        && request.resource.contentType.matches('image/.*|video/.*');
+        && request.resource.contentType.matches('image/.*|video/.*|audio/.*');
       allow update, delete: if false;
     }
   }

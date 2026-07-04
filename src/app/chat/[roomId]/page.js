@@ -15,7 +15,8 @@ import {
   deleteDoc,
   arrayRemove,
 } from "firebase/firestore";
-import { db } from "@/lib/firebase";
+import { getDownloadURL, ref, uploadBytes } from "firebase/storage";
+import { db, storage } from "@/lib/firebase";
 import { useAuth } from "@/context/AuthContext";
 import MessageBubble from "@/components/MessageBubble";
 import RoomAdminPanel from "@/components/RoomAdminPanel";
@@ -55,13 +56,53 @@ function getSendErrorMessage(err) {
   const code = err?.code || "";
   const message = err?.message || "";
 
+  if (code.includes("storage/unauthorized") || code.includes("storage/unauthenticated")) {
+    return "Voice upload was blocked by Firebase Storage rules. Upload the latest storage.rules file.";
+  }
+
   if (code.includes("permission-denied")) {
     return "Message sending was blocked by Firestore rules. Upload the latest firestore.rules file.";
   }
 
-  return message || "Message could not be sent. Check Firebase Firestore rules.";
+  return message || "Message could not be sent. Check Firebase Firestore and Storage rules.";
 }
 
+function cleanReply(message) {
+  if (!message) return null;
+  return {
+    id: message.id || "",
+    uid: message.uid || "",
+    displayName: message.displayName || "",
+    text: message.text || "",
+    type: message.type || "text",
+    mediaUrl: message.mediaUrl || null,
+    photoURL: message.photoURL || null,
+  };
+}
+
+function getVoiceMimeType() {
+  if (typeof MediaRecorder === "undefined") return "";
+  const options = ["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus", "audio/mp4"];
+  return options.find((type) => MediaRecorder.isTypeSupported(type)) || "";
+}
+
+function normalizeVoiceMimeType(mimeType) {
+  if (mimeType?.includes("ogg")) return "audio/ogg";
+  if (mimeType?.includes("mp4")) return "audio/mp4";
+  return "audio/webm";
+}
+
+function getVoiceExtension(mimeType) {
+  if (mimeType.includes("mp4")) return "m4a";
+  if (mimeType.includes("ogg")) return "ogg";
+  return "webm";
+}
+
+function formatRecordingTime(seconds) {
+  const minutes = Math.floor(seconds / 60).toString().padStart(2, "0");
+  const rest = (seconds % 60).toString().padStart(2, "0");
+  return `${minutes}:${rest}`;
+}
 
 export default function RoomPage() {
   const { roomId } = useParams();
@@ -74,8 +115,12 @@ export default function RoomPage() {
   const [replyTo, setReplyTo] = useState(null);
   const [error, setError] = useState("");
   const [sending, setSending] = useState(false);
+  const [voiceState, setVoiceState] = useState("idle"); // idle | recording | uploading
+  const [recordingSeconds, setRecordingSeconds] = useState(0);
   const [showEmojiPicker, setShowEmojiPicker] = useState(false);
   const [deletingMessageId, setDeletingMessageId] = useState("");
+  const [deleteTarget, setDeleteTarget] = useState(null);
+  const [deleteError, setDeleteError] = useState("");
   const [editingMessage, setEditingMessage] = useState(null);
   const [editText, setEditText] = useState("");
   const [savingEdit, setSavingEdit] = useState(false);
@@ -85,6 +130,12 @@ export default function RoomPage() {
   const [leaveError, setLeaveError] = useState("");
   const bottomRef = useRef(null);
   const inputRef = useRef(null);
+  const mediaRecorderRef = useRef(null);
+  const voiceChunksRef = useRef([]);
+  const voiceStreamRef = useRef(null);
+  const recordingTimerRef = useRef(null);
+  const recordingSecondsRef = useRef(0);
+  const recordingCancelledRef = useRef(false);
 
   useEffect(() => {
     const unsub = onSnapshot(
@@ -102,8 +153,8 @@ export default function RoomPage() {
     return () => unsub();
   }, [roomId]);
 
-  const isMember = !!room?.members?.includes(user.uid);
-  const isAdmin = !!room?.admins?.includes(user.uid);
+  const isMember = !!room?.members?.includes(user?.uid);
+  const isAdmin = !!room?.admins?.includes(user?.uid);
   const isSystemAdmin = isSystemAdminEmail(user?.email);
   const hasRoomAccess = isMember || isAdmin || isSystemAdmin;
   const isReady = roomState === "ok" && hasRoomAccess;
@@ -125,10 +176,19 @@ export default function RoomPage() {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages.length]);
 
+  useEffect(() => {
+    return () => {
+      if (recordingTimerRef.current) clearInterval(recordingTimerRef.current);
+      recordingCancelledRef.current = true;
+      if (mediaRecorderRef.current?.state === "recording") mediaRecorderRef.current.stop();
+      voiceStreamRef.current?.getTracks().forEach((track) => track.stop());
+    };
+  }, []);
+
   const handleSend = async (e) => {
     e.preventDefault();
     const trimmed = text.trim();
-    if (!trimmed || sending) return;
+    if (!trimmed || sending || !user) return;
 
     setSending(true);
     setShowEmojiPicker(false);
@@ -164,14 +224,148 @@ export default function RoomPage() {
     inputRef.current?.focus();
   };
 
+  const sendVoiceMessage = async (blob, mimeType, durationSeconds) => {
+    if (!user || !blob.size) return;
+
+    const contentType = normalizeVoiceMimeType(mimeType || blob.type);
+    const extension = getVoiceExtension(contentType);
+    const fileName = `voice-${Date.now()}.${extension}`;
+    const filePath = `rooms/${roomId}/uploads/${user.uid}-${fileName}`;
+    const storageRef = ref(storage, filePath);
+
+    await uploadBytes(storageRef, blob, { contentType });
+    const mediaUrl = await getDownloadURL(storageRef);
+
+    const messageData = {
+      text: "Voice message",
+      type: "voice",
+      mediaUrl,
+      fileName,
+      fileMimeType: contentType,
+      fileSize: blob.size,
+      durationSeconds,
+      uid: user.uid,
+      displayName: user.displayName || user.email,
+      photoURL: user.photoURL || null,
+      createdAt: serverTimestamp(),
+    };
+
+    if (replyTo) {
+      messageData.replyTo = cleanReply(replyTo);
+    }
+
+    await addDoc(collection(db, "rooms", roomId, "messages"), messageData);
+    setReplyTo(null);
+  };
+
+  const startVoiceRecording = async () => {
+    if (!user || voiceState !== "idle") return;
+    if (typeof window === "undefined" || !navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
+      setError("Voice messages are not supported in this browser.");
+      return;
+    }
+
+    setError("");
+    setShowEmojiPicker(false);
+    setRecordingSeconds(0);
+    recordingSecondsRef.current = 0;
+    recordingCancelledRef.current = false;
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+        },
+      });
+      const mimeType = getVoiceMimeType();
+      const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+
+      voiceChunksRef.current = [];
+      voiceStreamRef.current = stream;
+      mediaRecorderRef.current = recorder;
+
+      recorder.ondataavailable = (event) => {
+        if (event.data?.size > 0) voiceChunksRef.current.push(event.data);
+      };
+
+      recorder.onstop = async () => {
+        const chunks = voiceChunksRef.current;
+        const durationSeconds = recordingSecondsRef.current;
+        voiceChunksRef.current = [];
+        voiceStreamRef.current?.getTracks().forEach((track) => track.stop());
+        voiceStreamRef.current = null;
+
+        if (recordingCancelledRef.current) return;
+
+        if (!chunks.length) {
+          setVoiceState("idle");
+          setRecordingSeconds(0);
+          recordingSecondsRef.current = 0;
+          setError("No audio was recorded. Try again.");
+          return;
+        }
+
+        const finalMimeType = normalizeVoiceMimeType(recorder.mimeType || mimeType);
+        const blob = new Blob(chunks, { type: finalMimeType });
+
+        try {
+          await sendVoiceMessage(blob, finalMimeType, durationSeconds);
+        } catch (err) {
+          setError(getSendErrorMessage(err));
+        } finally {
+          setVoiceState("idle");
+          setRecordingSeconds(0);
+          recordingSecondsRef.current = 0;
+        }
+      };
+
+      recorder.start();
+      setVoiceState("recording");
+      recordingTimerRef.current = setInterval(() => {
+        recordingSecondsRef.current += 1;
+        setRecordingSeconds(recordingSecondsRef.current);
+      }, 1000);
+    } catch (err) {
+      setVoiceState("idle");
+      setError(
+        err?.name === "NotAllowedError"
+          ? "Microphone access was blocked. Please allow it and try again."
+          : "Couldn't start voice recording. Try again."
+      );
+      voiceStreamRef.current?.getTracks().forEach((track) => track.stop());
+      voiceStreamRef.current = null;
+    }
+  };
+
+  const stopVoiceRecording = () => {
+    if (voiceState !== "recording") return;
+    if (recordingTimerRef.current) clearInterval(recordingTimerRef.current);
+    recordingTimerRef.current = null;
+    setVoiceState("uploading");
+    if (mediaRecorderRef.current?.state === "recording") {
+      mediaRecorderRef.current.requestData?.();
+      mediaRecorderRef.current.stop();
+    }
+  };
+
+  const handleVoiceButton = () => {
+    if (voiceState === "recording") {
+      stopVoiceRecording();
+    } else if (voiceState === "idle") {
+      startVoiceRecording();
+    }
+  };
+
   const handleReplyMessage = (message) => {
+    if (!message) return;
     setReplyTo(cleanReply(message));
     setShowEmojiPicker(false);
     requestAnimationFrame(() => inputRef.current?.focus());
   };
 
   const handleStartEditMessage = (message) => {
-    const canEdit = message.uid === user.uid || isSystemAdmin;
+    const canEdit = message.uid === user?.uid || isSystemAdmin;
     if (!canEdit) return;
     setEditingMessage(message);
     setEditText(message.text || "");
@@ -184,8 +378,8 @@ export default function RoomPage() {
     const trimmed = editText.trim();
     if (!trimmed) return;
 
-    const canEdit = editingMessage.uid === user.uid || isSystemAdmin;
-    if (!canEdit) return;
+    const canEdit = editingMessage.uid === user?.uid || isSystemAdmin;
+    if (!canEdit || !user) return;
 
     setSavingEdit(true);
     try {
@@ -202,24 +396,38 @@ export default function RoomPage() {
     }
   };
 
-  const handleDeleteMessage = async (message) => {
-    const canDelete = message.uid === user.uid || isSystemAdmin;
+  const handleDeleteMessage = (message) => {
+    const canDelete = message.uid === user?.uid || isSystemAdmin;
     if (!canDelete || deletingMessageId) return;
 
-    const confirmed = window.confirm("Delete this message?");
-    if (!confirmed) return;
+    setDeleteTarget(message);
+    setDeleteError("");
+  };
 
-    setDeletingMessageId(message.id);
+  const handleCancelDelete = () => {
+    if (deletingMessageId) return;
+    setDeleteTarget(null);
+    setDeleteError("");
+  };
+
+  const handleConfirmDelete = async () => {
+    if (!deleteTarget) return;
+
+    setDeletingMessageId(deleteTarget.id);
+    setDeleteError("");
     try {
-      await deleteDoc(doc(db, "rooms", roomId, "messages", message.id));
+      await deleteDoc(doc(db, "rooms", roomId, "messages", deleteTarget.id));
+      setDeleteTarget(null);
     } catch {
-      alert("Couldn't delete this message. Check your Firestore rules and try again.");
+      setDeleteError("Couldn't delete this message. Check your Firestore rules and try again.");
     } finally {
       setDeletingMessageId("");
     }
   };
 
   const handleLeave = async () => {
+    if (!user || !room) return;
+
     setLeaving(true);
     setLeaveError("");
     try {
@@ -364,7 +572,7 @@ export default function RoomPage() {
                     key={m.id}
                     message={m}
                     isOwn={isMessageOwner}
-                    canEdit={canEditOrDeleteMessage}
+                    canEdit={canEditOrDeleteMessage && m.type === "text"}
                     canDelete={canEditOrDeleteMessage}
                     onReply={handleReplyMessage}
                     onEdit={handleStartEditMessage}
@@ -407,7 +615,7 @@ export default function RoomPage() {
                     <p className="text-xs font-semibold text-accent">
                       Replying to {replyTo.uid === user.uid ? "yourself" : replyTo.displayName || "Member"}
                     </p>
-                    <p className="line-clamp-2 text-xs text-textSecondary">{replyTo.type === "image" ? "Photo" : replyTo.type === "video" ? "Video" : replyTo.text || "Message"}</p>
+                    <p className="line-clamp-2 text-xs text-textSecondary">{replyTo.type === "image" ? "Photo" : replyTo.type === "video" ? "Video" : replyTo.type === "voice" ? "Voice message" : replyTo.text || "Message"}</p>
                   </div>
                   <button
                     type="button"
@@ -422,6 +630,29 @@ export default function RoomPage() {
 
 
 
+              {voiceState !== "idle" && (
+                <div className="mb-2 flex items-center justify-between gap-3 rounded-2xl border border-accent/25 bg-surface px-4 py-3 text-sm">
+                  <div className="flex min-w-0 items-center gap-3">
+                    <span className={`h-2.5 w-2.5 rounded-full ${voiceState === "recording" ? "animate-pulse bg-red-400" : "bg-accent"}`} />
+                    <div className="min-w-0">
+                      <p className="font-medium text-textPrimary">
+                        {voiceState === "recording" ? "Recording voice message" : "Sending voice message"}
+                      </p>
+                      <p className="text-xs text-textSecondary">{formatRecordingTime(recordingSeconds)}</p>
+                    </div>
+                  </div>
+                  {voiceState === "recording" && (
+                    <button
+                      type="button"
+                      onClick={stopVoiceRecording}
+                      className="rounded-lg bg-red-500 px-3 py-1.5 text-xs font-medium text-white hover:bg-red-400"
+                    >
+                      Stop
+                    </button>
+                  )}
+                </div>
+              )}
+
               {error && <p className="mb-2 px-2 text-xs text-red-400">{error}</p>}
 
               <div className="flex items-end gap-2">
@@ -430,11 +661,27 @@ export default function RoomPage() {
                 <button
                   type="button"
                   onClick={() => setShowEmojiPicker((open) => !open)}
+                  disabled={voiceState !== "idle"}
                   className="flex h-12 w-12 shrink-0 items-center justify-center rounded-full border border-border bg-surface text-lg text-textSecondary transition hover:border-accent/50 hover:bg-surfaceHover hover:text-textPrimary active:scale-[0.97]"
                   aria-label="Open emoji picker"
                   title="Emoji"
                 >
                   😊
+                </button>
+
+                <button
+                  type="button"
+                  onClick={handleVoiceButton}
+                  disabled={voiceState === "uploading" || sending}
+                  className={`flex h-12 w-12 shrink-0 items-center justify-center rounded-full border transition active:scale-[0.97] disabled:opacity-50 ${
+                    voiceState === "recording"
+                      ? "border-red-400/60 bg-red-500 text-white shadow-lg shadow-red-950/20"
+                      : "border-border bg-surface text-textSecondary hover:border-accent/50 hover:bg-surfaceHover hover:text-accent"
+                  }`}
+                  aria-label={voiceState === "recording" ? "Stop voice recording" : "Record voice message"}
+                  title={voiceState === "recording" ? "Stop recording" : "Voice message"}
+                >
+                  {voiceState === "uploading" ? <SpinnerIcon /> : voiceState === "recording" ? <StopIcon /> : <MicIcon />}
                 </button>
 
                 <div className="flex min-h-12 min-w-0 flex-1 items-center rounded-[24px] border border-border bg-surface px-4 text-textPrimary shadow-inner">
@@ -443,8 +690,9 @@ export default function RoomPage() {
                     value={text}
                     onChange={(e) => setText(e.target.value)}
                     placeholder="Message"
+                    disabled={voiceState !== "idle"}
                     rows={1}
-                    className="max-h-32 min-h-[24px] w-full resize-none bg-transparent py-3 text-[15px] leading-6 placeholder:text-textSecondary focus:outline-none"
+                    className="max-h-32 min-h-[24px] w-full resize-none bg-transparent py-3 text-[15px] leading-6 placeholder:text-textSecondary focus:outline-none disabled:opacity-60"
                     onKeyDown={(e) => {
                       if (e.key === "Enter" && !e.shiftKey) {
                         e.preventDefault();
@@ -456,7 +704,7 @@ export default function RoomPage() {
 
                 <button
                   type="submit"
-                  disabled={!text.trim() || sending}
+                  disabled={!text.trim() || sending || voiceState !== "idle"}
                   className="flex h-12 w-12 shrink-0 items-center justify-center rounded-full bg-accent text-bg shadow-lg transition hover:opacity-90 active:scale-[0.97] disabled:opacity-45"
                   aria-label="Send message"
                 >
@@ -504,6 +752,47 @@ export default function RoomPage() {
       )}
 
       {showAdmin && room && <RoomAdminPanel room={room} onClose={() => setShowAdmin(false)} />}
+
+      {deleteTarget && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 px-4 backdrop-blur-sm">
+          <div className="w-full max-w-sm overflow-hidden rounded-2xl border border-red-400/25 bg-surface shadow-2xl shadow-black/40">
+            <div className="border-b border-border bg-gradient-to-br from-red-500/14 via-surface to-surface px-6 py-5">
+              <div className="mb-4 flex h-11 w-11 items-center justify-center rounded-full border border-red-400/30 bg-red-500/12 text-red-300">
+                <TrashIcon />
+              </div>
+              <h2 className="font-display text-lg font-semibold text-textPrimary">Delete this message?</h2>
+              <p className="mt-2 text-sm leading-6 text-textSecondary">
+                This message will be removed from the room for everyone. This action cannot be undone.
+              </p>
+            </div>
+
+            <div className="px-6 py-5">
+              <div className="mb-4 max-h-28 overflow-y-auto rounded-xl border border-border bg-bg/70 px-3 py-2 text-sm text-textSecondary">
+                {deleteTarget.text || (deleteTarget.type === "image" ? "Photo message" : deleteTarget.type === "video" ? "Video message" : "Message")}
+              </div>
+              {deleteError && <p className="mb-4 text-xs text-red-400">{deleteError}</p>}
+              <div className="flex justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={handleCancelDelete}
+                  disabled={!!deletingMessageId}
+                  className="rounded-lg px-3 py-2 text-sm text-textSecondary transition hover:bg-surfaceHover hover:text-textPrimary disabled:opacity-50"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={handleConfirmDelete}
+                  disabled={!!deletingMessageId}
+                  className="rounded-lg bg-red-500 px-3 py-2 text-sm font-medium text-white shadow-lg shadow-red-950/20 transition hover:bg-red-400 disabled:opacity-50"
+                >
+                  {deletingMessageId ? "Deleting..." : "Delete message"}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {showLeaveConfirm && room && (
         <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/60 px-4">
@@ -589,10 +878,38 @@ function SendIcon() {
   );
 }
 
+function MicIcon() {
+  return (
+    <svg width="21" height="21" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <path d="M12 14.5a3.5 3.5 0 0 0 3.5-3.5V6.5a3.5 3.5 0 0 0-7 0V11a3.5 3.5 0 0 0 3.5 3.5Z" stroke="currentColor" strokeWidth="2" />
+      <path d="M5.5 10.5v.7a6.5 6.5 0 0 0 13 0v-.7M12 17.8V21M9 21h6" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+function StopIcon() {
+  return (
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <rect x="7" y="7" width="10" height="10" rx="2" fill="currentColor" />
+    </svg>
+  );
+}
+
 function CloseIcon() {
   return (
     <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
       <path d="M6 6l12 12M18 6 6 18" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+function TrashIcon() {
+  return (
+    <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+      <path d="M3 6h18" strokeLinecap="round" />
+      <path d="M8 6V4h8v2" strokeLinecap="round" strokeLinejoin="round" />
+      <path d="M6.5 6l1 14h9l1-14" strokeLinecap="round" strokeLinejoin="round" />
+      <path d="M10 11v5M14 11v5" strokeLinecap="round" />
     </svg>
   );
 }

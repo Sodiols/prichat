@@ -117,15 +117,16 @@ service cloud.firestore {
             "fileName",
             "fileMimeType",
             "fileSize",
+            "durationSeconds",
             "uid",
             "displayName",
             "photoURL",
             "createdAt",
             "replyTo"
           ])
-          && request.resource.data.type in ["text", "image", "video"]
+          && request.resource.data.type in ["text", "image", "video", "voice"]
           && request.resource.data.text is string
-          && (request.resource.data.text.size() > 0 || request.resource.data.type in ["image", "video"])
+          && (request.resource.data.text.size() > 0 || request.resource.data.type in ["image", "video", "voice"])
           && (
             request.resource.data.type == "text"
             || (
@@ -135,6 +136,14 @@ service cloud.firestore {
               && request.resource.data.fileMimeType is string
               && request.resource.data.fileSize is int
               && request.resource.data.fileSize < 100 * 1024 * 1024
+              && (
+                request.resource.data.type != "voice"
+                || (
+                  request.resource.data.durationSeconds is int
+                  && request.resource.data.durationSeconds >= 0
+                  && request.resource.data.durationSeconds < 3600
+                )
+              )
             )
           );
 

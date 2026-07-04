@@ -22,6 +22,8 @@ export default function RoomAdminPanel({ room, onClose }) {
   const [profiles, setProfiles] = useState({}); // uid -> { displayName, photoURL, email }
   const [requests, setRequests] = useState([]);
   const [addEmail, setAddEmail] = useState("");
+  const [renameValue, setRenameValue] = useState(room.name || "");
+  const [renamingRoom, setRenamingRoom] = useState(false);
   const [error, setError] = useState("");
   const [busyUid, setBusyUid] = useState(null);
   const [addBusy, setAddBusy] = useState(false);
@@ -30,6 +32,10 @@ export default function RoomAdminPanel({ room, onClose }) {
   const isLastAdmin = room.admins.length <= 1;
 
   const memberKey = room.members.join(",");
+
+  useEffect(() => {
+    setRenameValue(room.name || "");
+  }, [room.name]);
 
   // Load display info for every current member.
   useEffect(() => {
@@ -92,6 +98,22 @@ export default function RoomAdminPanel({ room, onClose }) {
     }
   };
 
+  const handleRenameRoom = async (e) => {
+    e.preventDefault();
+    const nextName = renameValue.trim();
+    if (!nextName || nextName === room.name) return;
+
+    setRenamingRoom(true);
+    setError("");
+    try {
+      await updateDoc(roomRef, { name: nextName });
+    } catch {
+      setError("Couldn't rename the room. Try again.");
+    } finally {
+      setRenamingRoom(false);
+    }
+  };
+
   const handleAddByEmail = async (e) => {
     e.preventDefault();
     const email = addEmail.trim().toLowerCase();
@@ -147,6 +169,22 @@ export default function RoomAdminPanel({ room, onClose }) {
           </button>
         </div>
         <p className="text-textSecondary text-xs mb-4">Room ID: {room.id}</p>
+
+        <form onSubmit={handleRenameRoom} className="mb-5 flex items-center gap-2">
+          <input
+            value={renameValue}
+            onChange={(e) => setRenameValue(e.target.value)}
+            placeholder="Room name"
+            className="flex-1 bg-bg border border-border rounded-lg px-3 py-2 text-base sm:text-sm focus:outline-none focus:ring-2 focus:ring-accent"
+          />
+          <button
+            type="submit"
+            disabled={renamingRoom || !renameValue.trim() || renameValue.trim() === room.name}
+            className="px-3 py-2 text-sm rounded-lg bg-accent text-bg font-medium disabled:opacity-50 shrink-0"
+          >
+            {renamingRoom ? "Saving…" : "Rename"}
+          </button>
+        </form>
 
         {error && <p className="text-red-400 text-xs mb-3">{error}</p>}
 
