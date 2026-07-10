@@ -18,13 +18,11 @@ export const metadata: Metadata = {
   applicationName: SITE_NAME,
   keywords: [
     "PriChat",
+    "secret messaging app",
+    "private messaging",
     "realtime chat",
     "private chat rooms",
     "online chat app",
-    "group chat",
-    "voice messages",
-    "video call",
-    "audio call",
     "browser chat",
     "free chat app",
     "encrypted rooms",
@@ -49,6 +47,9 @@ export const metadata: Metadata = {
     card: "summary_large_image",
     title: "PriChat — Free Realtime Private Chat Rooms & Video Calls",
     description: DESCRIPTION,
+  },
+  verification: {
+    google: "n8GT8LiHVSkwwvoPwVFiZYYmvDnMvy-cW0sa0emwdbg",
   },
   robots: {
     index: true,
