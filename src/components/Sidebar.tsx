@@ -4,7 +4,8 @@ import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { supabase } from "@/lib/supabase";
-import { mapRoom } from "@/lib/mappers";
+import { mapProfile, mapRoom } from "@/lib/mappers";
+import { isProfileOnline } from "@/lib/presence";
 import { useAuth } from "@/context/AuthContext";
 import { useSidebar } from "@/context/SidebarContext";
 import { isSystemAdminEmail } from "@/lib/systemAdmin";
@@ -21,6 +22,7 @@ export default function Sidebar() {
   const [myRooms, setMyRooms] = useState([]);
   const [publicRooms, setPublicRooms] = useState([]);
   const [privateRooms, setPrivateRooms] = useState([]);
+  const [profilesById, setProfilesById] = useState({});
   const [showCreate, setShowCreate] = useState(false);
   const [showJoin, setShowJoin] = useState(false);
   const [joiningPrivateRoom, setJoiningPrivateRoom] = useState("");
@@ -43,6 +45,21 @@ export default function Sidebar() {
     }
 
     const rooms = (allRooms || []).map(mapRoom);
+    const memberIds = Array.from(new Set(rooms.flatMap((room) => room.members || [])));
+    if (memberIds.length > 0) {
+      const { data: profileRows } = await supabase
+        .from("profiles")
+        .select("*")
+        .in("id", memberIds);
+      const nextProfiles = {};
+      (profileRows || []).forEach((row) => {
+        const profile = mapProfile(row);
+        if (profile) nextProfiles[profile.uid] = profile;
+      });
+      setProfilesById(nextProfiles);
+    } else {
+      setProfilesById({});
+    }
 
     setMyRooms(
       rooms.filter((r) => r.members.includes(user.uid) || r.admins.includes(user.uid))
@@ -78,6 +95,9 @@ export default function Sidebar() {
   const notYetJoinedPublicRooms = publicRooms.filter(
     (r) => !r.members?.includes(user?.uid) && !r.admins?.includes(user?.uid)
   );
+
+  const roomOnlineCount = (room) =>
+    (room.members || []).filter((uid) => isProfileOnline(profilesById[uid])).length;
 
   const handleLogout = async () => {
     await logout();
@@ -177,11 +197,17 @@ export default function Sidebar() {
                     key={room.id}
                     href={`/chat/${room.id}`}
                     onClick={closeMobile}
-                    className={`flex items-center gap-1.5 rounded-lg px-3 py-2.5 sm:py-2 text-sm transition-colors ${
+                    className={`flex items-center gap-2 rounded-lg px-3 py-2.5 sm:py-2 text-sm transition-colors ${
                       active ? "bg-accentMuted text-accent" : "text-textPrimary hover:bg-surfaceHover"
                     }`}
                   >
-                    <span className="truncate"># {room.name}</span>
+                    <span className="relative shrink-0">
+                      <UserAvatar name={room.name} photoURL={room.photoURL} size="sm" />
+                      {roomOnlineCount(room) > 0 && (
+                        <span className="absolute -bottom-0.5 -right-0.5 h-2.5 w-2.5 rounded-full border-2 border-surface bg-accent" />
+                      )}
+                    </span>
+                    <span className="min-w-0 flex-1 truncate"># {room.name}</span>
                     {room.privacy !== "public" && <LockIcon />}
                   </Link>
                 );
@@ -213,7 +239,13 @@ export default function Sidebar() {
                         active ? "border-accent bg-accentMuted" : "border-border bg-bg/40 hover:bg-surfaceHover"
                       }`}
                     >
-                      <div className="flex items-center gap-1.5 min-w-0 mb-2">
+                      <div className="flex items-center gap-2 min-w-0 mb-2">
+                        <span className="relative shrink-0">
+                          <UserAvatar name={room.name} photoURL={room.photoURL} size="sm" />
+                          {roomOnlineCount(room) > 0 && (
+                            <span className="absolute -bottom-0.5 -right-0.5 h-2.5 w-2.5 rounded-full border-2 border-bg bg-accent" />
+                          )}
+                        </span>
                         <span className="text-sm font-medium truncate"># {room.name}</span>
                         <LockIcon />
                       </div>
@@ -258,7 +290,15 @@ export default function Sidebar() {
                     key={room.id}
                     className="flex items-center justify-between gap-2 rounded-lg px-3 py-2.5 sm:py-2 text-sm text-textPrimary hover:bg-surfaceHover"
                   >
-                    <span className="truncate"># {room.name}</span>
+                    <span className="flex min-w-0 items-center gap-2">
+                      <span className="relative shrink-0">
+                        <UserAvatar name={room.name} photoURL={room.photoURL} size="sm" />
+                        {roomOnlineCount(room) > 0 && (
+                          <span className="absolute -bottom-0.5 -right-0.5 h-2.5 w-2.5 rounded-full border-2 border-surface bg-accent" />
+                        )}
+                      </span>
+                      <span className="truncate"># {room.name}</span>
+                    </span>
                     <button
                       onClick={() => handleQuickJoin(room.id)}
                       className="text-xs text-accent hover:underline shrink-0"

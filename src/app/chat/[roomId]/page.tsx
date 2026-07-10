@@ -7,10 +7,12 @@ import { mapMessage, mapProfile, mapRoom } from "@/lib/mappers";
 import { useAuth } from "@/context/AuthContext";
 import MessageBubble from "@/components/MessageBubble";
 import RoomAdminPanel from "@/components/RoomAdminPanel";
+import RoomPeoplePanel from "@/components/RoomPeoplePanel";
 import CallPanel from "@/components/CallPanel";
 import MobileMenuButton from "@/components/MobileMenuButton";
 import UserAvatar from "@/components/UserAvatar";
 import { isSystemAdminEmail } from "@/lib/systemAdmin";
+import { isProfileOnline } from "@/lib/presence";
 
 const EMOJI_OPTIONS = [
   "😀",
@@ -94,14 +96,43 @@ function getMentionToken(value, cursor) {
   };
 }
 
-async function showWebsiteNotification(title, body) {
+async function getNotificationRegistration() {
+  if (typeof navigator === "undefined" || !("serviceWorker" in navigator)) return null;
+  await navigator.serviceWorker.register("/prichat-sw.js").catch(() => null);
+  return navigator.serviceWorker.ready.catch(() => null);
+}
+
+async function requestWebsiteNotificationPermission() {
   if (typeof window === "undefined" || !("Notification" in window)) return;
   if (Notification.permission === "default") {
     await Notification.requestPermission().catch(() => "denied");
   }
+  await getNotificationRegistration();
+  return Notification.permission;
+}
+
+async function showWebsiteNotification(title, body, url) {
+  if (typeof window === "undefined" || !("Notification" in window)) return;
+  await requestWebsiteNotificationPermission();
   if (Notification.permission === "granted") {
-    new Notification(title, { body });
+    const registration = await getNotificationRegistration();
+    if (registration) {
+      await registration.showNotification(title, {
+        body,
+        icon: "/icon.svg",
+        badge: "/icon.svg",
+        tag: `prichat-${url}`,
+        data: { url },
+      });
+      return Notification.permission;
+    }
+    try {
+      new Notification(title, { body });
+    } catch {
+      // Mobile browsers generally require the service-worker path above.
+    }
   }
+  return Notification.permission;
 }
 
 function getVoiceMimeType() {
@@ -136,6 +167,7 @@ export default function RoomPage() {
   const [roomState, setRoomState] = useState("loading"); // loading | ok | not-found | denied
   const [messages, setMessages] = useState([]);
   const [memberProfiles, setMemberProfiles] = useState([]);
+  const [readProfilesByMessage, setReadProfilesByMessage] = useState({});
   const [text, setText] = useState("");
   const [mentionToken, setMentionToken] = useState(null);
   const [mentionToast, setMentionToast] = useState(null);
@@ -152,6 +184,8 @@ export default function RoomPage() {
   const [editText, setEditText] = useState("");
   const [savingEdit, setSavingEdit] = useState(false);
   const [showAdmin, setShowAdmin] = useState(false);
+  const [showPeople, setShowPeople] = useState(false);
+  const [notificationPermission, setNotificationPermission] = useState("unsupported");
   const [showLeaveConfirm, setShowLeaveConfirm] = useState(false);
   const [leaving, setLeaving] = useState(false);
   const [leaveError, setLeaveError] = useState("");
@@ -163,6 +197,15 @@ export default function RoomPage() {
   const recordingTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const recordingSecondsRef = useRef(0);
   const recordingCancelledRef = useRef(false);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || !("Notification" in window)) {
+      setNotificationPermission("unsupported");
+      return;
+    }
+    setNotificationPermission(Notification.permission);
+    getNotificationRegistration();
+  }, []);
 
   useEffect(() => {
     let active = true;
@@ -250,6 +293,12 @@ export default function RoomPage() {
     return [...everyone, ...users];
   }, [memberProfiles, mentionToken, user?.uid]);
 
+  const onlineMemberProfiles = useMemo(
+    () => memberProfiles.filter(isProfileOnline),
+    [memberProfiles]
+  );
+  const onlineCount = onlineMemberProfiles.length;
+
   useEffect(() => {
     if (!isReady) return undefined;
     let active = true;
@@ -284,7 +333,9 @@ export default function RoomPage() {
             const body = `#${room?.name || "PriChat"}: ${mapped.text || "Open the room"}`;
             setMentionToast({ title, body });
             window.setTimeout(() => setMentionToast(null), 5000);
-            showWebsiteNotification(title, body);
+            showWebsiteNotification(title, body, `/chat/${roomId}`).then((permission) => {
+              if (permission) setNotificationPermission(permission);
+            });
           }
 
           setMessages((current) => {
@@ -339,6 +390,68 @@ export default function RoomPage() {
       supabase.removeChannel(channel);
     };
   }, [isReady, memberKey, roomId]);
+
+  const messageReadKey = visibleMessages
+    .filter((message) => !["system", "call"].includes(message.type))
+    .map((message) => message.id)
+    .join(",");
+
+  useEffect(() => {
+    const messageIds = messageReadKey ? messageReadKey.split(",") : [];
+    if (!isReady || messageIds.length === 0) {
+      setReadProfilesByMessage({});
+      return undefined;
+    }
+
+    let active = true;
+    const loadReads = async () => {
+      const { data } = await supabase
+        .from("message_reads")
+        .select("message_id, uid, profiles(*)")
+        .in("message_id", messageIds);
+      if (!active) return;
+
+      const next = {};
+      (data || []).forEach((row) => {
+        const profile = mapProfile(row.profiles);
+        if (!profile) return;
+        next[row.message_id] = [...(next[row.message_id] || []), profile];
+      });
+      setReadProfilesByMessage(next);
+    };
+
+    loadReads();
+    const channel = supabase
+      .channel(`message-reads:${roomId}`)
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "message_reads" },
+        () => loadReads()
+      )
+      .subscribe();
+
+    return () => {
+      active = false;
+      supabase.removeChannel(channel);
+    };
+  }, [isReady, messageReadKey, roomId]);
+
+  useEffect(() => {
+    if (!isReady || !user?.uid) return;
+    const rows = visibleMessages
+      .filter((message) => !["system", "call"].includes(message.type))
+      .filter((message) => message.uid !== user.uid)
+      .map((message) => ({
+        message_id: message.id,
+        uid: user.uid,
+        read_at: new Date().toISOString(),
+      }));
+    if (rows.length === 0) return;
+    supabase
+      .from("message_reads")
+      .upsert(rows, { onConflict: "message_id,uid" })
+      .then(() => {});
+  }, [isReady, user?.uid, messageReadKey, visibleMessages]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -419,6 +532,11 @@ export default function RoomPage() {
       inputRef.current?.focus();
       inputRef.current?.setSelectionRange(nextCursor, nextCursor);
     });
+  };
+
+  const handleEnableNotifications = async () => {
+    const permission = await requestWebsiteNotificationPermission();
+    setNotificationPermission(permission || "unsupported");
   };
 
   const sendVoiceMessage = async (blob, mimeType, durationSeconds) => {
@@ -671,13 +789,21 @@ export default function RoomPage() {
 
             <div className="min-w-0 flex-1">
               <h1 className="truncate text-[16px] font-semibold leading-tight">{room.name}</h1>
-              <p className="truncate text-xs text-textSecondary">Realtime private chat</p>
+              <p className="flex items-center gap-1.5 truncate text-xs text-textSecondary">
+                {onlineCount > 0 && <span className="h-1.5 w-1.5 rounded-full bg-accent" />}
+                <span>{onlineCount} online</span>
+              </p>
             </div>
 
             <div className="flex items-center gap-1 text-textSecondary">
               {(isAdmin || isSystemAdmin) && (
                 <HeaderIconButton label="Manage room" onClick={() => setShowAdmin(true)}>
                   <GroupIcon />
+                </HeaderIconButton>
+              )}
+              {notificationPermission === "default" && (
+                <HeaderIconButton label="Enable notifications" onClick={handleEnableNotifications}>
+                  <BellIcon />
                 </HeaderIconButton>
               )}
               <HeaderIconButton
@@ -701,6 +827,22 @@ export default function RoomPage() {
                   className="rounded-full border border-border px-3 py-1.5 text-xs text-textSecondary hover:bg-surfaceHover hover:text-textPrimary"
                 >
                   Manage
+                </button>
+              )}
+              {!isAdmin && !isSystemAdmin && (
+                <button
+                  onClick={() => setShowPeople(true)}
+                  className="rounded-full border border-border px-3 py-1.5 text-xs text-textSecondary hover:bg-surfaceHover hover:text-textPrimary"
+                >
+                  Add people
+                </button>
+              )}
+              {notificationPermission === "default" && (
+                <button
+                  onClick={handleEnableNotifications}
+                  className="rounded-full border border-border px-3 py-1.5 text-xs text-textSecondary hover:bg-surfaceHover hover:text-textPrimary"
+                >
+                  Enable notifications
                 </button>
               )}
               <button
@@ -782,6 +924,7 @@ export default function RoomPage() {
                     isOwn={isMessageOwner}
                     canEdit={canEditOrDeleteMessage && m.type === "text"}
                     canDelete={canEditOrDeleteMessage && !["system", "call"].includes(m.type)}
+                    seenBy={(readProfilesByMessage[m.id] || []).filter((profile) => profile.uid !== m.uid)}
                     onReply={handleReplyMessage}
                     onEdit={handleStartEditMessage}
                     onDelete={handleDeleteMessage}
@@ -989,6 +1132,13 @@ export default function RoomPage() {
       )}
 
       {showAdmin && room && <RoomAdminPanel room={room} onClose={() => setShowAdmin(false)} />}
+      {showPeople && room && (
+        <RoomPeoplePanel
+          room={room}
+          profiles={memberProfiles}
+          onClose={() => setShowPeople(false)}
+        />
+      )}
 
       {deleteTarget && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 px-4 backdrop-blur-sm">
@@ -1101,6 +1251,15 @@ function VideoIcon() {
     <svg width="24" height="24" viewBox="0 0 24 24" fill="none" aria-hidden="true">
       <path d="M4 7.5C4 6.1 5.1 5 6.5 5h6C13.9 5 15 6.1 15 7.5v9c0 1.4-1.1 2.5-2.5 2.5h-6C5.1 19 4 17.9 4 16.5v-9Z" stroke="currentColor" strokeWidth="2" />
       <path d="m15 10 4-2.3c.7-.4 1.5.1 1.5.9v6.8c0 .8-.8 1.3-1.5.9L15 14" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
+function BellIcon() {
+  return (
+    <svg width="21" height="21" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <path d="M18 9a6 6 0 1 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9Z" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+      <path d="M10 21h4" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
     </svg>
   );
 }

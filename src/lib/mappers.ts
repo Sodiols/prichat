@@ -34,6 +34,7 @@ export function mapRoom(row: Row | null | undefined): Room | null {
   return {
     id: row.id,
     name: row.name,
+    photoURL: row.photo_url || null,
     privacy: row.privacy,
     passcodeHash: row.passcode_hash || null,
     createdBy: row.created_by,

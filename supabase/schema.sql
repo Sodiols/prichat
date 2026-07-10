@@ -26,6 +26,7 @@ create table if not exists public.profiles (
 create table if not exists public.rooms (
   id            uuid primary key default gen_random_uuid(),
   name          text not null,
+  photo_url     text,
   privacy       text not null default 'public' check (privacy in ('public', 'passcode', 'approval')),
   passcode_hash text,
   created_by    uuid not null,
@@ -68,6 +69,16 @@ create unique index if not exists profiles_username_unique_idx
   where username is not null;
 create index if not exists messages_mentions_idx
   on public.messages using gin (mentioned_usernames);
+
+alter table public.rooms add column if not exists photo_url text;
+
+create table if not exists public.message_reads (
+  message_id uuid not null references public.messages (id) on delete cascade,
+  uid        uuid not null references public.profiles (id) on delete cascade,
+  read_at    timestamptz default now(),
+  primary key (message_id, uid)
+);
+create index if not exists message_reads_uid_idx on public.message_reads (uid);
 
 create table if not exists public.join_requests (
   room_id      uuid not null references public.rooms (id) on delete cascade,
@@ -409,6 +420,53 @@ begin
 end;
 $$;
 
+create or replace function public.add_room_member_by_email(p_room_id uuid, p_email text)
+returns uuid
+language plpgsql security definer set search_path = public
+as $$
+declare
+  target_profile public.profiles;
+  r public.rooms;
+begin
+  if auth.uid() is null then
+    raise exception 'Not authenticated';
+  end if;
+
+  select * into r from public.rooms where id = p_room_id;
+  if not found then
+    raise exception 'Room not found';
+  end if;
+
+  if not public.is_room_member(p_room_id) then
+    raise exception 'Not allowed';
+  end if;
+
+  select * into target_profile
+  from public.profiles
+  where lower(email) = lower(trim(p_email))
+  limit 1;
+
+  if not found then
+    raise exception 'No user found with that email';
+  end if;
+
+  update public.rooms
+    set members = (select array(select distinct unnest(members || target_profile.id)))
+  where id = p_room_id;
+
+  if not target_profile.id = any (r.members) then
+    perform public.insert_room_event(
+      p_room_id,
+      format('%s joined', coalesce(target_profile.username, target_profile.display_name, 'Member')),
+      'room_joined',
+      target_profile.id
+    );
+  end if;
+
+  return target_profile.id;
+end;
+$$;
+
 -- Remove the caller from a room. Deletes the room when nobody is left.
 create or replace function public.leave_room(p_room_id uuid)
 returns void
@@ -506,6 +564,7 @@ alter default privileges in schema public
 alter table public.profiles            enable row level security;
 alter table public.rooms               enable row level security;
 alter table public.messages            enable row level security;
+alter table public.message_reads       enable row level security;
 alter table public.join_requests       enable row level security;
 alter table public.calls               enable row level security;
 alter table public.call_participants   enable row level security;
@@ -575,6 +634,38 @@ drop policy if exists messages_delete on public.messages;
 create policy messages_delete on public.messages
   for delete to authenticated
   using (public.is_room_member(room_id) and (uid = auth.uid() or public.is_system_admin()));
+
+-- message_reads ----------------------------------------------------------------
+drop policy if exists message_reads_select on public.message_reads;
+create policy message_reads_select on public.message_reads
+  for select to authenticated
+  using (
+    exists (
+      select 1
+      from public.messages m
+      where m.id = message_id
+        and public.is_room_member(m.room_id)
+    )
+  );
+
+drop policy if exists message_reads_insert on public.message_reads;
+create policy message_reads_insert on public.message_reads
+  for insert to authenticated
+  with check (
+    uid = auth.uid()
+    and exists (
+      select 1
+      from public.messages m
+      where m.id = message_id
+        and public.is_room_member(m.room_id)
+    )
+  );
+
+drop policy if exists message_reads_update on public.message_reads;
+create policy message_reads_update on public.message_reads
+  for update to authenticated
+  using (uid = auth.uid())
+  with check (uid = auth.uid());
 
 -- join_requests ----------------------------------------------------------------
 drop policy if exists join_requests_select on public.join_requests;
@@ -657,6 +748,7 @@ create policy ice_insert on public.call_ice_candidates
 alter table public.profiles            replica identity full;
 alter table public.rooms               replica identity full;
 alter table public.messages            replica identity full;
+alter table public.message_reads       replica identity full;
 alter table public.join_requests       replica identity full;
 alter table public.calls               replica identity full;
 alter table public.call_participants   replica identity full;
@@ -668,7 +760,7 @@ declare
   t text;
 begin
   foreach t in array array[
-    'profiles', 'rooms', 'messages', 'join_requests',
+    'profiles', 'rooms', 'messages', 'message_reads', 'join_requests',
     'calls', 'call_participants', 'call_peers', 'call_ice_candidates'
   ]
   loop

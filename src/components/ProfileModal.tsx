@@ -104,7 +104,7 @@ export default function ProfileModal({ onClose }) {
         <div className="flex items-center justify-between gap-3 mb-4">
           <div>
             <h2 className="font-display text-lg font-semibold">Edit profile</h2>
-            <p className="text-xs text-textSecondary">Change your name and profile picture.</p>
+            <p className="text-xs text-textSecondary">Change your display name, username, and logo.</p>
           </div>
           <button type="button" onClick={onClose} className="text-sm text-textSecondary hover:text-textPrimary">
             Close
@@ -112,7 +112,13 @@ export default function ProfileModal({ onClose }) {
         </div>
 
         <div className="flex flex-col items-center gap-3 mb-5">
-          <div className="h-24 w-24 overflow-hidden rounded-full border border-border bg-bg flex items-center justify-center">
+          <button
+            type="button"
+            onClick={() => photoURL && setPhotoURL("")}
+            className="h-24 w-24 overflow-hidden rounded-full border border-border bg-bg flex items-center justify-center transition hover:border-red-400/60"
+            title={photoURL ? "Remove logo" : "No logo selected"}
+            aria-label={photoURL ? "Remove profile logo" : "Profile logo preview"}
+          >
             {photoURL ? (
               <img src={photoURL} alt="Profile preview" className="h-full w-full object-cover" />
             ) : (
@@ -120,7 +126,7 @@ export default function ProfileModal({ onClose }) {
                 {(displayName || user?.email || "P").slice(0, 1).toUpperCase()}
               </span>
             )}
-          </div>
+          </button>
           <div className="flex gap-2">
             <input ref={fileRef} type="file" accept="image/*" onChange={handleFile} className="hidden" />
             <button
@@ -128,7 +134,7 @@ export default function ProfileModal({ onClose }) {
               onClick={() => fileRef.current?.click()}
               className="rounded-lg border border-border px-3 py-1.5 text-xs text-textSecondary hover:border-accent/50 hover:text-textPrimary"
             >
-              Upload picture
+              Upload logo
             </button>
             {photoURL && (
               <button
@@ -136,14 +142,14 @@ export default function ProfileModal({ onClose }) {
                 onClick={() => setPhotoURL("")}
                 className="rounded-lg border border-border px-3 py-1.5 text-xs text-textSecondary hover:text-red-400"
               >
-                Remove
+                Remove logo
               </button>
             )}
           </div>
         </div>
 
         <label className="block text-xs uppercase tracking-wider text-textSecondary mb-1">
-          Username
+          Display name
         </label>
         <input
           value={displayName}
@@ -153,7 +159,7 @@ export default function ProfileModal({ onClose }) {
         />
 
         <label className="mt-4 block text-xs uppercase tracking-wider text-textSecondary mb-1">
-          Unique @username
+          Username
         </label>
         <div className="flex items-center rounded-lg border border-border bg-bg px-3 focus-within:ring-2 focus-within:ring-accent">
           <span className="select-none text-textSecondary">@</span>

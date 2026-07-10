@@ -29,6 +29,7 @@ export interface AppUser {
 export interface Room {
   id: string;
   name: string;
+  photoURL: string | null;
   privacy: RoomPrivacy;
   passcodeHash: string | null;
   createdBy: string;

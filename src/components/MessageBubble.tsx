@@ -12,14 +12,6 @@ function formatTime(message) {
     : "sending…";
 }
 
-function formatDuration(seconds) {
-  if (!Number.isFinite(seconds) || seconds < 1) return "";
-  const minutes = Math.floor(seconds / 60);
-  const rest = seconds % 60;
-  if (minutes < 1) return `${rest}s`;
-  return rest ? `${minutes}m ${rest}s` : `${minutes}m`;
-}
-
 function previewText(message) {
   if (!message) return "";
   if (message.type === "image") return message.text || "Photo";
@@ -37,6 +29,7 @@ export default function MessageBubble({
   onEdit,
   onDelete,
   deleting,
+  seenBy = [],
 }) {
   const time = formatTime(message);
   const wasEdited = !!message.editedAt;
@@ -44,17 +37,12 @@ export default function MessageBubble({
   const hasMedia = !!message.mediaUrl && ["image", "video", "voice"].includes(message.type);
 
   if (message.type === "system" || message.type === "call") {
-    const eventType = message.metadata?.eventType || "";
-    const duration = formatDuration(message.durationSeconds || message.metadata?.durationSeconds || 0);
     return (
       <div className="flex w-full justify-center px-2 py-1">
         <div className="max-w-[92%] rounded-full border border-border bg-surface/80 px-3 py-1.5 text-center text-xs text-textSecondary shadow-sm">
           <span className={message.type === "call" ? "text-accent" : "text-textPrimary"}>
             {message.text}
           </span>
-          {duration && eventType === "call_ended" && (
-            <span className="ml-1 text-textSecondary">({duration})</span>
-          )}
           <span className="ml-2 text-[10px] text-textSecondary/80">{time}</span>
         </div>
       </div>
@@ -160,10 +148,51 @@ export default function MessageBubble({
             )}
           </div>
         </div>
+        <SeenByLine seenBy={seenBy} isOwn={isOwn} />
       </div>
 
       {isOwn && (
         <UserAvatar name={message.displayName || "You"} photoURL={message.photoURL} size="sm" />
+      )}
+    </div>
+  );
+}
+
+function SeenByLine({ seenBy, isOwn }) {
+  const [open, setOpen] = useState(false);
+  if (!seenBy.length) return null;
+
+  const visible = seenBy.slice(0, 2);
+  const hidden = seenBy.slice(2);
+
+  return (
+    <div className={`relative px-1 text-[11px] text-textSecondary ${isOwn ? "text-right" : "text-left"}`}>
+      <span>Seen by {visible.map((profile) => profile.username || profile.displayName || "Member").join(", ")}</span>
+      {hidden.length > 0 && (
+        <button
+          type="button"
+          onClick={() => setOpen((value) => !value)}
+          className="ml-1 rounded px-1 text-accent hover:bg-surfaceHover"
+          aria-label="Show everyone who saw this message"
+        >
+          ...
+        </button>
+      )}
+      {open && (
+        <div className={`absolute z-20 mt-1 w-56 rounded-xl border border-border bg-surface p-2 text-left shadow-2xl shadow-black/30 ${isOwn ? "right-0" : "left-0"}`}>
+          <p className="mb-1 px-2 text-[10px] uppercase tracking-wider text-textSecondary">Seen by</p>
+          <div className="max-h-48 space-y-1 overflow-y-auto">
+            {seenBy.map((profile) => (
+              <div key={profile.uid} className="flex items-center gap-2 rounded-lg px-2 py-1.5 hover:bg-surfaceHover">
+                <UserAvatar name={profile.displayName} photoURL={profile.photoURL} size="sm" />
+                <span className="min-w-0 flex-1 truncate text-xs text-textPrimary">
+                  {profile.displayName || profile.username || "Member"}
+                </span>
+                {profile.username && <span className="truncate text-[11px] text-textSecondary">@{profile.username}</span>}
+              </div>
+            ))}
+          </div>
+        </div>
       )}
     </div>
   );

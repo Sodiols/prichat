@@ -1,5 +1,6 @@
 "use client";
 
+import { useEffect } from "react";
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { useAuth } from "@/context/AuthContext";
@@ -34,8 +35,12 @@ export default function LoginPage() {
   const [name, setName] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
-  const { login, signup, loginWithGoogle } = useAuth();
+  const { user, loading: authLoading, login, signup, loginWithGoogle } = useAuth();
   const router = useRouter();
+
+  useEffect(() => {
+    if (!authLoading && user) router.replace("/chat");
+  }, [authLoading, router, user]);
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -67,6 +72,14 @@ export default function LoginPage() {
       setLoading(false);
     }
   };
+
+  if (authLoading || user) {
+    return (
+      <div className="min-h-dvh flex items-center justify-center bg-bg">
+        <div className="h-3 w-3 rounded-full bg-accent animate-pulse" />
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-dvh flex items-center justify-center bg-bg px-4">

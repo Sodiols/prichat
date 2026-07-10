@@ -10,6 +10,9 @@ if (!supabaseUrl || !supabaseAnonKey) {
   );
 }
 
+const browserStorage =
+  typeof window !== "undefined" ? window.localStorage : undefined;
+
 // Single browser client shared across the app. Sessions persist in localStorage
 // and are auto-refreshed, mirroring the old Firebase Auth behaviour.
 export const supabase = createClient(supabaseUrl, supabaseAnonKey, {
@@ -17,6 +20,8 @@ export const supabase = createClient(supabaseUrl, supabaseAnonKey, {
     persistSession: true,
     autoRefreshToken: true,
     detectSessionInUrl: true,
+    storage: browserStorage,
+    storageKey: "prichat-auth-session",
   },
 });
 

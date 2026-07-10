@@ -1,13 +1,39 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { supabase } from "@/lib/supabase";
 import { mapJoinRequest, mapProfile } from "@/lib/mappers";
+import { isProfileOnline } from "@/lib/presence";
 import { useAuth } from "@/context/AuthContext";
+import UserAvatar from "./UserAvatar";
 
 // Deduplicated array helpers so we can update the uuid[] columns in place.
 const withValue = (arr, value) => Array.from(new Set([...(arr || []), value]));
 const withoutValue = (arr, value) => (arr || []).filter((v) => v !== value);
+
+function resizeImage(file: File, size = 256): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const img = new Image();
+      img.onload = () => {
+        const canvas = document.createElement("canvas");
+        canvas.width = size;
+        canvas.height = size;
+        const ctx = canvas.getContext("2d");
+        const minSide = Math.min(img.width, img.height);
+        const sx = (img.width - minSide) / 2;
+        const sy = (img.height - minSide) / 2;
+        ctx!.drawImage(img, sx, sy, minSide, minSide, 0, 0, size, size);
+        resolve(canvas.toDataURL("image/jpeg", 0.82));
+      };
+      img.onerror = reject;
+      img.src = reader.result as string;
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
 
 export default function RoomAdminPanel({ room, onClose }) {
   const { user } = useAuth();
@@ -19,11 +45,14 @@ export default function RoomAdminPanel({ room, onClose }) {
   const [error, setError] = useState("");
   const [busyUid, setBusyUid] = useState(null);
   const [addBusy, setAddBusy] = useState(false);
+  const [logoBusy, setLogoBusy] = useState(false);
+  const logoInputRef = useRef<HTMLInputElement | null>(null);
 
   const isLastAdmin = room.admins.length <= 1;
 
   const updateRoom = (patch) => supabase.from("rooms").update(patch).eq("id", room.id);
   const displayHandle = (profile) => profile?.username || profile?.displayName || "Member";
+  const adminHandle = user?.username || user?.displayName || "Admin";
 
   const insertRoomEvent = async (text, eventType, targetUid = null) => {
     await supabase
@@ -126,7 +155,11 @@ export default function RoomAdminPanel({ room, onClose }) {
         members: withoutValue(room.members, uid),
         admins: withoutValue(room.admins, uid),
       });
-      await insertRoomEvent(`${displayHandle(profiles[uid])} left`, "room_left", uid);
+      await insertRoomEvent(
+        `${adminHandle} removed "${displayHandle(profiles[uid])}"`,
+        "member_removed",
+        uid
+      );
     } finally {
       setBusyUid(null);
     }
@@ -146,6 +179,45 @@ export default function RoomAdminPanel({ room, onClose }) {
       setError("Couldn't rename the room. Try again.");
     } finally {
       setRenamingRoom(false);
+    }
+  };
+
+  const handleLogoFile = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    if (!file.type.startsWith("image/")) {
+      setError("Choose an image file for the server logo.");
+      return;
+    }
+    if (file.size > 5 * 1024 * 1024) {
+      setError("Choose an image under 5 MB.");
+      return;
+    }
+
+    setLogoBusy(true);
+    setError("");
+    try {
+      const photoURL = await resizeImage(file);
+      const { error: updateError } = await updateRoom({ photo_url: photoURL });
+      if (updateError) throw updateError;
+    } catch {
+      setError("Couldn't update the server logo. Try another image.");
+    } finally {
+      setLogoBusy(false);
+      if (logoInputRef.current) logoInputRef.current.value = "";
+    }
+  };
+
+  const handleRemoveLogo = async () => {
+    setLogoBusy(true);
+    setError("");
+    try {
+      const { error: updateError } = await updateRoom({ photo_url: null });
+      if (updateError) throw updateError;
+    } catch {
+      setError("Couldn't remove the server logo.");
+    } finally {
+      setLogoBusy(false);
     }
   };
 
@@ -233,6 +305,35 @@ export default function RoomAdminPanel({ room, onClose }) {
           </button>
         </form>
 
+        <div className="mb-5 rounded-xl border border-border bg-bg/60 p-3">
+          <div className="flex items-center gap-3">
+            <UserAvatar name={room.name} photoURL={room.photoURL} size="lg" />
+            <div className="min-w-0 flex-1">
+              <p className="truncate text-sm font-medium text-textPrimary">Server logo</p>
+              <p className="text-xs text-textSecondary">Shown in the room header.</p>
+            </div>
+            <input ref={logoInputRef} type="file" accept="image/*" onChange={handleLogoFile} className="hidden" />
+            <button
+              type="button"
+              onClick={() => logoInputRef.current?.click()}
+              disabled={logoBusy}
+              className="rounded-lg border border-border px-3 py-1.5 text-xs text-textSecondary hover:border-accent/50 hover:text-textPrimary disabled:opacity-50"
+            >
+              {logoBusy ? "Saving..." : "Change"}
+            </button>
+            {room.photoURL && (
+              <button
+                type="button"
+                onClick={handleRemoveLogo}
+                disabled={logoBusy}
+                className="rounded-lg border border-border px-3 py-1.5 text-xs text-textSecondary hover:text-red-300 disabled:opacity-50"
+              >
+                Remove
+              </button>
+            )}
+          </div>
+        </div>
+
         {error && <p className="text-red-400 text-xs mb-3">{error}</p>}
 
         {room.privacy === "approval" && (
@@ -291,6 +392,7 @@ export default function RoomAdminPanel({ room, onClose }) {
                       {profile?.displayName || "…"} {isSelf && <span className="text-textSecondary">(you)</span>}
                     </span>
                     {isAdmin && <span className="text-[11px] text-accent">Admin</span>}
+                    {isProfileOnline(profile) && <span className="ml-2 text-[11px] text-accent">online</span>}
                   </div>
                   {!isSelf && (
                     <div className="flex gap-2 shrink-0">

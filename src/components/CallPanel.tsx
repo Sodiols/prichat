@@ -51,6 +51,7 @@ export default function CallPanel({ roomId, room, user, isAdmin, isSystemAdmin }
   const hiddenJoinRef = useRef(false);
   const peerConnectionsRef = useRef<Map<string, RTCPeerConnection>>(new Map());
   const peerUnsubsRef = useRef<Map<string, Array<() => void>>>(new Map());
+  const remoteMediaStreamsRef = useRef<Map<string, MediaStream>>(new Map());
   const processedCandidatesRef = useRef<Map<string, Set<string>>>(new Map());
   const pendingCandidatesRef = useRef<Map<string, RTCIceCandidate[]>>(new Map());
   const remoteDescriptionSetRef = useRef<Set<string>>(new Set());
@@ -82,7 +83,7 @@ export default function CallPanel({ roomId, room, user, isAdmin, isSystemAdmin }
           p_event_type: eventType,
           p_target_uid: options.targetUid || null,
           p_call_id: options.callId || activeCallRef.current?.id || null,
-          p_duration_seconds: options.durationSeconds || null,
+          p_duration_seconds: options.durationSeconds ?? null,
           p_actor_uid: options.actorUid || null,
         })
         .then(() => {});
@@ -90,11 +91,44 @@ export default function CallPanel({ roomId, room, user, isAdmin, isSystemAdmin }
     [roomId]
   );
 
+  const resolveCallStartedAt = useCallback(
+    async (call) => {
+      const fallback =
+        call?.createdAt instanceof Date
+          ? call.createdAt
+          : new Date(call?.createdAt || Date.now());
+
+      try {
+        const { data } = await supabase
+          .from("messages")
+          .select("created_at, metadata")
+          .eq("room_id", roomId)
+          .eq("type", "call")
+          .order("created_at", { ascending: false })
+          .limit(100);
+
+        const startedMessage = (data || []).find((message) => {
+          const metadata = message.metadata || {};
+          return metadata.eventType === "call_started" && metadata.callId === call.id;
+        });
+        const startedAt = startedMessage?.created_at
+          ? new Date(startedMessage.created_at)
+          : fallback;
+
+        return Number.isNaN(startedAt.getTime()) ? fallback : startedAt;
+      } catch {
+        return fallback;
+      }
+    },
+    [roomId]
+  );
+
   const writeCallEndEvents = useCallback(
     async (call) => {
       if (!call) return;
-      const createdAt = call.createdAt instanceof Date ? call.createdAt : new Date(call.createdAt || Date.now());
-      const durationSeconds = Math.max(0, Math.round((Date.now() - createdAt.getTime()) / 1000));
+      const startedAt = await resolveCallStartedAt(call);
+      const endedAt = new Date();
+      const durationSeconds = Math.max(0, Math.round((endedAt.getTime() - startedAt.getTime()) / 1000));
       const pickedUids = new Set(
         participants
           .filter((participant) => !participant.hidden)
@@ -120,7 +154,7 @@ export default function CallPanel({ roomId, room, user, isAdmin, isSystemAdmin }
         )
       );
     },
-    [insertCallEvent, participants, room?.members]
+    [insertCallEvent, participants, resolveCallStartedAt, room?.members]
   );
 
   useEffect(() => {
@@ -216,6 +250,7 @@ export default function CallPanel({ roomId, room, user, isAdmin, isSystemAdmin }
     peerUnsubsRef.current.clear();
     peerConnectionsRef.current.forEach((pc) => pc.close());
     peerConnectionsRef.current.clear();
+    remoteMediaStreamsRef.current.clear();
     processedCandidatesRef.current.clear();
     pendingCandidatesRef.current.clear();
     remoteDescriptionSetRef.current.clear();
@@ -342,8 +377,11 @@ export default function CallPanel({ roomId, room, user, isAdmin, isSystemAdmin }
       }
 
       pc.ontrack = (event) => {
-        const [stream] = event.streams;
-        if (!stream) return;
+        const stream = event.streams[0] || remoteMediaStreamsRef.current.get(remoteParticipant.uid) || new MediaStream();
+        if (!event.streams[0] && event.track && !stream.getTracks().some((track) => track.id === event.track.id)) {
+          stream.addTrack(event.track);
+        }
+        remoteMediaStreamsRef.current.set(remoteParticipant.uid, stream);
         setRemoteStreams((current) => ({
           ...current,
           [remoteParticipant.uid]: stream,
@@ -351,12 +389,13 @@ export default function CallPanel({ roomId, room, user, isAdmin, isSystemAdmin }
       };
 
       pc.oniceconnectionstatechange = () => {
-        if (["failed", "closed", "disconnected"].includes(pc.iceConnectionState)) {
+        if (["failed", "closed"].includes(pc.iceConnectionState)) {
           setRemoteStreams((current) => {
             const next = { ...current };
             delete next[remoteParticipant.uid];
             return next;
           });
+          remoteMediaStreamsRef.current.delete(remoteParticipant.uid);
         }
       };
 
@@ -506,6 +545,7 @@ export default function CallPanel({ roomId, room, user, isAdmin, isSystemAdmin }
       if (liveIds.has(uid)) return;
       pc.close();
       peerConnectionsRef.current.delete(uid);
+      remoteMediaStreamsRef.current.delete(uid);
       peerUnsubsRef.current.get(uid)?.forEach((unsub) => unsub?.());
       peerUnsubsRef.current.delete(uid);
       setRemoteStreams((current) => {
@@ -967,29 +1007,16 @@ function LocalMediaPreview({ stream, mirrored }: { stream: MediaStream; mirrored
 }
 
 function RemoteMediaTile({ participant, stream, type, speakerOn }: any) {
-  const videoRef = useRef<any>(null);
-
-  useEffect(() => {
-    if (videoRef.current && stream) {
-      videoRef.current.srcObject = stream;
-    }
-  }, [stream]);
-
-  const showVideo = type === "video" && stream && !participant.cameraOff;
+  const hasVideoTrack = !!stream?.getVideoTracks?.().some((track) => track.readyState === "live");
+  const showVideo = type === "video" && stream && hasVideoTrack && !participant.cameraOff;
 
   return (
     <div className="relative min-h-40 overflow-hidden rounded-xl border border-border bg-bg">
       {showVideo ? (
-        <video
-          ref={videoRef}
-          autoPlay
-          playsInline
-          muted={!speakerOn}
-          className="h-full min-h-40 w-full object-cover"
-        />
+        <RemoteVideo stream={stream} muted={!speakerOn} />
       ) : stream ? (
         <>
-          <audio ref={videoRef} autoPlay muted={!speakerOn} />
+          <RemoteAudio stream={stream} muted={!speakerOn} />
           <ParticipantPlaceholder participant={participant} />
         </>
       ) : (
@@ -1003,6 +1030,56 @@ function RemoteMediaTile({ participant, stream, type, speakerOn }: any) {
       />
     </div>
   );
+}
+
+function RemoteVideo({ stream, muted }: { stream: MediaStream; muted: boolean }) {
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    video.srcObject = stream;
+    video.play().catch(() => {});
+
+    return () => {
+      video.srcObject = null;
+    };
+  }, [stream]);
+
+  useEffect(() => {
+    if (videoRef.current) videoRef.current.muted = muted;
+  }, [muted]);
+
+  return (
+    <video
+      ref={videoRef}
+      autoPlay
+      playsInline
+      muted={muted}
+      className="h-full min-h-40 w-full object-cover"
+    />
+  );
+}
+
+function RemoteAudio({ stream, muted }: { stream: MediaStream; muted: boolean }) {
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+
+  useEffect(() => {
+    const audio = audioRef.current;
+    if (!audio) return;
+    audio.srcObject = stream;
+    audio.play().catch(() => {});
+
+    return () => {
+      audio.srcObject = null;
+    };
+  }, [stream]);
+
+  useEffect(() => {
+    if (audioRef.current) audioRef.current.muted = muted;
+  }, [muted]);
+
+  return <audio ref={audioRef} autoPlay muted={muted} />;
 }
 
 function ParticipantPlaceholder({ participant, label }: any) {
