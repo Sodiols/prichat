@@ -36,7 +36,6 @@ export default function CallPanel({ roomId, room, user, isAdmin, isSystemAdmin }
   const [speakerOn, setSpeakerOn] = useState(true);
   const [screenSharing, setScreenSharing] = useState(false);
 
-  const localVideoRef = useRef<HTMLVideoElement | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
   const screenStreamRef = useRef<MediaStream | null>(null);
   const activeCallRef = useRef<any>(null);
@@ -153,12 +152,6 @@ export default function CallPanel({ roomId, room, user, isAdmin, isSystemAdmin }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [roomId, activeCall?.id]);
 
-  useEffect(() => {
-    if (localVideoRef.current && localStream) {
-      localVideoRef.current.srcObject = localStream;
-    }
-  }, [localStream]);
-
   const cleanupPeers = useCallback(() => {
     peerUnsubsRef.current.forEach((unsubs) => unsubs.forEach((unsub) => unsub?.()));
     peerUnsubsRef.current.clear();
@@ -200,6 +193,32 @@ export default function CallPanel({ roomId, room, user, isAdmin, isSystemAdmin }
     setScreenSharing(false);
   }, []);
 
+  const closeCallIfEmpty = useCallback(async (callId) => {
+    const { count, error: countError } = await supabase
+      .from("call_participants")
+      .select("uid", { count: "exact", head: true })
+      .eq("call_id", callId)
+      .is("left_at", null);
+    if (countError || count !== 0) return;
+
+    await supabase
+      .rpc("end_call_if_empty", { p_call_id: callId })
+      .then(async ({ error: rpcError }) => {
+        if (!rpcError) return;
+        await supabase
+          .from("calls")
+          .update({
+            status: "ended",
+            ended_by: userId,
+            ended_at: new Date().toISOString(),
+            updated_at: new Date().toISOString(),
+          })
+          .eq("id", callId)
+          .eq("status", "active")
+          .then(() => {});
+      });
+  }, [userId]);
+
   const leaveCurrentCall = useCallback(
     async ({ markLeft = true } = {}) => {
       const call = activeCallRef.current;
@@ -223,9 +242,10 @@ export default function CallPanel({ roomId, room, user, isAdmin, isSystemAdmin }
           .eq("call_id", call.id)
           .eq("uid", userId)
           .then(() => {});
+        await closeCallIfEmpty(call.id);
       }
     },
-    [cleanupPeers, stopLocalMedia, userId]
+    [cleanupPeers, closeCallIfEmpty, stopLocalMedia, userId]
   );
 
   useEffect(() => {
@@ -578,6 +598,7 @@ export default function CallPanel({ roomId, room, user, isAdmin, isSystemAdmin }
     screenStreamRef.current = null;
     const cameraTrack = localStreamRef.current?.getVideoTracks()[0] || null;
     await replaceVideoTrack(cameraTrack);
+    setLocalStream(localStreamRef.current);
     setScreenSharing(false);
     if (activeCall) {
       await supabase
@@ -599,6 +620,7 @@ export default function CallPanel({ roomId, room, user, isAdmin, isSystemAdmin }
       const screenTrack = screenStream.getVideoTracks()[0];
       screenStreamRef.current = screenStream;
       await replaceVideoTrack(screenTrack);
+      setLocalStream(screenStream);
       setScreenSharing(true);
       screenTrack.onended = () => stopScreenShare();
       if (activeCall) {
@@ -781,7 +803,7 @@ export default function CallPanel({ roomId, room, user, isAdmin, isSystemAdmin }
             {!hiddenJoin && (
               <div className={`relative overflow-hidden rounded-xl border border-border bg-bg ${activeCall.type === "video" ? "min-h-56" : "min-h-40"}`}>
                 {localStream && activeCall.type === "video" && !cameraOff ? (
-                  <video ref={localVideoRef} autoPlay playsInline muted className="h-full min-h-56 w-full object-cover" />
+                  <LocalMediaPreview stream={localStream} mirrored={!screenSharing} />
                 ) : (
                   <ParticipantPlaceholder participant={joinedParticipant || { displayName: userName, photoURL: userPhotoURL }} label="You" />
                 )}
@@ -846,6 +868,31 @@ function VideoIcon() {
       <path d="M4 7.5C4 6.1 5.1 5 6.5 5h6C13.9 5 15 6.1 15 7.5v9c0 1.4-1.1 2.5-2.5 2.5h-6C5.1 19 4 17.9 4 16.5v-9Z" stroke="currentColor" strokeWidth="2" />
       <path d="m15 10 4-2.3c.7-.4 1.5.1 1.5.9v6.8c0 .8-.8 1.3-1.5.9L15 14" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
     </svg>
+  );
+}
+
+function LocalMediaPreview({ stream, mirrored }: { stream: MediaStream; mirrored: boolean }) {
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+
+  useEffect(() => {
+    if (!videoRef.current) return;
+    const video = videoRef.current;
+    video.srcObject = stream;
+    video.play().catch(() => {});
+
+    return () => {
+      video.srcObject = null;
+    };
+  }, [stream]);
+
+  return (
+    <video
+      ref={videoRef}
+      autoPlay
+      playsInline
+      muted
+      className={`h-full min-h-56 w-full object-cover ${mirrored ? "-scale-x-100" : ""}`}
+    />
   );
 }
 

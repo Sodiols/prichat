@@ -160,6 +160,40 @@ as $$
   );
 $$;
 
+create or replace function public.end_call_if_empty(p_call_id uuid)
+returns boolean
+language plpgsql security definer set search_path = public
+as $$
+declare
+  updated_count integer := 0;
+begin
+  if auth.uid() is null then
+    raise exception 'Not authenticated';
+  end if;
+
+  if not public.is_call_member(p_call_id) then
+    raise exception 'Not allowed';
+  end if;
+
+  update public.calls c
+    set status = 'ended',
+        ended_by = auth.uid(),
+        ended_at = now(),
+        updated_at = now()
+  where c.id = p_call_id
+    and c.status = 'active'
+    and not exists (
+      select 1
+      from public.call_participants cp
+      where cp.call_id = c.id
+        and cp.left_at is null
+    );
+
+  get diagnostics updated_count = row_count;
+  return updated_count > 0;
+end;
+$$;
+
 -- -----------------------------------------------------------------------------
 -- Membership RPCs (security definer): let non-admins self-join / self-leave
 -- while keeping direct UPDATE on rooms restricted to admins.
