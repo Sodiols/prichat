@@ -632,40 +632,42 @@ export default function CallPanel({ roomId, room, user, isAdmin, isSystemAdmin }
   if (!user) return null;
   const callLabel = activeCall?.type === "video" ? "Video" : "Audio";
 
+  // No active call: the Audio/Video call controls live in the room header, which
+  // delegates its clicks to these hidden trigger buttons. Nothing else renders
+  // here so there's no redundant "Start a website call" banner.
+  if (!activeCall) {
+    return (
+      <>
+        <button
+          id="call-audio-button"
+          type="button"
+          onClick={() => startCall("audio")}
+          className="hidden"
+          aria-hidden="true"
+          tabIndex={-1}
+        />
+        <button
+          id="call-video-button"
+          type="button"
+          onClick={() => startCall("video")}
+          className="hidden"
+          aria-hidden="true"
+          tabIndex={-1}
+        />
+        {error && (
+          <div className="shrink-0 border-b border-border bg-bg/90 px-3 py-2 sm:px-6">
+            <p className="rounded-xl border border-red-400/25 bg-red-500/10 px-3 py-2 text-xs text-red-300">
+              {error}
+            </p>
+          </div>
+        )}
+      </>
+    );
+  }
+
   return (
     <div className="shrink-0 border-b border-border bg-bg/90 px-3 py-3 sm:px-6">
       <div className="flex flex-col gap-3">
-        {!activeCall && (
-          <div className="flex flex-col gap-3 rounded-2xl border border-border bg-surface px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
-            <div className="min-w-0">
-              <p className="font-display text-sm font-semibold text-textPrimary">Start a website call</p>
-              <p className="text-xs text-textSecondary">Use audio or video with everyone in this room.</p>
-            </div>
-            <div className="grid grid-cols-2 gap-2 sm:flex">
-            <button
-              id="call-audio-button"
-              type="button"
-              onClick={() => startCall("audio")}
-              disabled={joining}
-                className="inline-flex items-center justify-center gap-2 rounded-xl border border-border bg-bg px-3 py-2 text-xs font-medium text-textPrimary transition hover:border-accent/50 hover:bg-surfaceHover disabled:opacity-50"
-            >
-                <PhoneIcon />
-                Audio call
-            </button>
-            <button
-              id="call-video-button"
-              type="button"
-              onClick={() => startCall("video")}
-              disabled={joining}
-                className="inline-flex items-center justify-center gap-2 rounded-xl bg-accent px-3 py-2 text-xs font-semibold text-bg transition hover:opacity-90 disabled:opacity-50"
-            >
-                <VideoIcon />
-                Video call
-            </button>
-            </div>
-          </div>
-        )}
-
         {activeCall && !joined && (
           <div className="flex flex-col gap-3 rounded-2xl border border-accent/35 bg-accentMuted/30 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
             <div className="min-w-0">
