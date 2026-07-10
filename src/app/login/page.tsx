@@ -71,10 +71,16 @@ export default function LoginPage() {
   return (
     <div className="min-h-dvh flex items-center justify-center bg-bg px-4">
       <div className="w-full max-w-sm">
-        <div className="flex items-center justify-center gap-2 mb-8">
+        <div className="flex items-center justify-center gap-2 mb-2">
           <PriChatMark />
           <span className="font-display text-2xl font-semibold tracking-tight">PriChat</span>
         </div>
+        <h1 className="sr-only">
+          PriChat — Free realtime private chat rooms with voice messages and video calls
+        </h1>
+        <p className="mb-8 text-center text-sm text-textSecondary">
+          Realtime private chat rooms · voice messages · audio &amp; video calls
+        </p>
 
         <div className="bg-surface border border-border rounded-2xl p-6">
           <div className="flex mb-6 rounded-lg bg-bg border border-border p-1">
