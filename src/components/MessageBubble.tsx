@@ -1,6 +1,7 @@
 /* eslint-disable @next/next/no-img-element */
 "use client";
 
+import { useMemo, useRef, useState } from "react";
 import UserAvatar from "./UserAvatar";
 
 function formatTime(message) {
@@ -17,13 +18,6 @@ function previewText(message) {
   if (message.type === "video") return message.text || "Video";
   if (message.type === "voice") return "Voice message";
   return message.text || "Message";
-}
-
-function formatDuration(seconds) {
-  if (!seconds) return "";
-  const minutes = Math.floor(seconds / 60).toString().padStart(2, "0");
-  const rest = Math.floor(seconds % 60).toString().padStart(2, "0");
-  return `${minutes}:${rest}`;
 }
 
 export default function MessageBubble({
@@ -91,21 +85,7 @@ export default function MessageBubble({
             )}
 
             {message.type === "voice" && message.mediaUrl && (
-              <div className={`mb-2 min-w-[220px] rounded-xl border px-3 py-2 ${
-                isOwn ? "border-bg/20 bg-bg/10" : "border-border bg-bg/70"
-              }`}>
-                <div className="mb-2 flex items-center justify-between gap-3">
-                  <span className={isOwn ? "text-xs font-medium text-bg" : "text-xs font-medium text-textPrimary"}>
-                    Voice message
-                  </span>
-                  {message.durationSeconds ? (
-                    <span className={isOwn ? "text-[11px] text-bg/65" : "text-[11px] text-textSecondary"}>
-                      {formatDuration(message.durationSeconds)}
-                    </span>
-                  ) : null}
-                </div>
-                <audio src={message.mediaUrl} controls preload="metadata" className="h-9 w-full min-w-0" />
-              </div>
+              <VoiceMessage message={message} isOwn={isOwn} />
             )}
 
             {message.text && message.type !== "voice" && (
@@ -200,6 +180,143 @@ function TrashIcon() {
       <path d="M8 6V4h8v2" strokeLinecap="round" strokeLinejoin="round" />
       <path d="M6.5 6l1 14h9l1-14" strokeLinecap="round" strokeLinejoin="round" />
       <path d="M10 11v5M14 11v5" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+// Deterministic waveform heights derived from the message id, so each voice
+// message keeps a stable, unique-looking waveform between renders.
+function waveformBars(seed, count = 30) {
+  let h = 2166136261;
+  const source = seed || "voice";
+  for (let i = 0; i < source.length; i++) {
+    h ^= source.charCodeAt(i);
+    h = Math.imul(h, 16777619) >>> 0;
+  }
+  const bars = [];
+  for (let i = 0; i < count; i++) {
+    h = (Math.imul(h, 1103515245) + 12345) >>> 0;
+    bars.push(0.28 + (h % 1000) / 1000 * 0.72); // 0.28 .. 1.0
+  }
+  return bars;
+}
+
+function formatClock(seconds) {
+  if (!Number.isFinite(seconds) || seconds < 0) seconds = 0;
+  const m = Math.floor(seconds / 60);
+  const s = Math.floor(seconds % 60).toString().padStart(2, "0");
+  return `${m}:${s}`;
+}
+
+function VoiceMessage({ message, isOwn }) {
+  const audioRef = useRef(null);
+  const [playing, setPlaying] = useState(false);
+  const [current, setCurrent] = useState(0);
+  const [loadedDuration, setLoadedDuration] = useState(0);
+
+  const bars = useMemo(
+    () => waveformBars(message.id || message.mediaUrl),
+    [message.id, message.mediaUrl]
+  );
+
+  // MediaRecorder webm often reports an Infinity duration, so fall back to the
+  // length we captured while recording.
+  const duration =
+    Number.isFinite(loadedDuration) && loadedDuration > 0
+      ? loadedDuration
+      : message.durationSeconds || 0;
+  const progress = duration > 0 ? Math.min(current / duration, 1) : 0;
+
+  const toggle = () => {
+    const el = audioRef.current;
+    if (!el) return;
+    if (playing) el.pause();
+    else el.play().catch(() => {});
+  };
+
+  const seek = (e) => {
+    const el = audioRef.current;
+    if (!el || !duration) return;
+    const rect = e.currentTarget.getBoundingClientRect();
+    const ratio = Math.min(Math.max((e.clientX - rect.left) / rect.width, 0), 1);
+    const next = ratio * duration;
+    el.currentTime = next;
+    setCurrent(next);
+  };
+
+  const playBtn = isOwn ? "bg-bg text-accent" : "bg-accent text-bg";
+  const barActive = isOwn ? "bg-bg" : "bg-accent";
+  const barInactive = isOwn ? "bg-bg/25" : "bg-textSecondary/35";
+  const timeText = isOwn ? "text-bg/70" : "text-textSecondary";
+
+  return (
+    <div
+      className={`mb-2 flex min-w-[236px] max-w-[280px] items-center gap-2.5 rounded-2xl px-2.5 py-2 ${
+        isOwn ? "bg-bg/10" : "bg-bg/60"
+      }`}
+    >
+      <audio
+        ref={audioRef}
+        src={message.mediaUrl}
+        preload="metadata"
+        className="hidden"
+        onPlay={() => setPlaying(true)}
+        onPause={() => setPlaying(false)}
+        onEnded={() => {
+          setPlaying(false);
+          setCurrent(0);
+        }}
+        onTimeUpdate={(e) => setCurrent(e.currentTarget.currentTime)}
+        onLoadedMetadata={(e) => setLoadedDuration(e.currentTarget.duration)}
+      />
+
+      <button
+        type="button"
+        onClick={toggle}
+        className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-full shadow-sm transition active:scale-95 ${playBtn}`}
+        aria-label={playing ? "Pause voice message" : "Play voice message"}
+      >
+        {playing ? <PauseIcon /> : <PlayIcon />}
+      </button>
+
+      <button
+        type="button"
+        onClick={seek}
+        className="flex h-8 flex-1 items-center gap-[2px]"
+        aria-label="Seek within voice message"
+      >
+        {bars.map((height, i) => {
+          const active = i / bars.length < progress;
+          return (
+            <span
+              key={i}
+              className={`flex-1 rounded-full transition-colors ${active ? barActive : barInactive}`}
+              style={{ height: `${Math.round(height * 100)}%` }}
+            />
+          );
+        })}
+      </button>
+
+      <span className={`shrink-0 text-[11px] tabular-nums ${timeText}`}>
+        {formatClock(playing || current > 0 ? current : duration)}
+      </span>
+    </div>
+  );
+}
+
+function PlayIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+      <path d="M8 5.5v13a1 1 0 0 0 1.5.87l11-6.5a1 1 0 0 0 0-1.74l-11-6.5A1 1 0 0 0 8 5.5Z" />
+    </svg>
+  );
+}
+
+function PauseIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+      <rect x="6.5" y="5" width="4" height="14" rx="1.4" />
+      <rect x="13.5" y="5" width="4" height="14" rx="1.4" />
     </svg>
   );
 }
