@@ -1,20 +1,8 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import {
-  addDoc,
-  collection,
-  deleteDoc,
-  doc,
-  getDoc,
-  onSnapshot,
-  query,
-  serverTimestamp,
-  setDoc,
-  updateDoc,
-  where,
-} from "firebase/firestore";
-import { db } from "@/lib/firebase";
+import { supabase } from "@/lib/supabase";
+import { mapCall, mapParticipant } from "@/lib/mappers";
 import UserAvatar from "./UserAvatar";
 
 const RTC_SERVERS = {
@@ -34,32 +22,32 @@ function toPlainDescription(description) {
 }
 
 export default function CallPanel({ roomId, room, user, isAdmin, isSystemAdmin }) {
-  const [activeCall, setActiveCall] = useState(null);
-  const [participants, setParticipants] = useState([]);
+  const [activeCall, setActiveCall] = useState<any>(null);
+  const [participants, setParticipants] = useState<any[]>([]);
   const [joined, setJoined] = useState(false);
   const [hiddenJoin, setHiddenJoin] = useState(false);
   const [joining, setJoining] = useState(false);
   const [panelOpen, setPanelOpen] = useState(false);
   const [error, setError] = useState("");
-  const [localStream, setLocalStream] = useState(null);
-  const [remoteStreams, setRemoteStreams] = useState({});
+  const [localStream, setLocalStream] = useState<MediaStream | null>(null);
+  const [remoteStreams, setRemoteStreams] = useState<Record<string, MediaStream>>({});
   const [muted, setMuted] = useState(false);
   const [cameraOff, setCameraOff] = useState(false);
   const [speakerOn, setSpeakerOn] = useState(true);
   const [screenSharing, setScreenSharing] = useState(false);
 
-  const localVideoRef = useRef(null);
-  const localStreamRef = useRef(null);
-  const screenStreamRef = useRef(null);
-  const activeCallRef = useRef(null);
+  const localVideoRef = useRef<HTMLVideoElement | null>(null);
+  const localStreamRef = useRef<MediaStream | null>(null);
+  const screenStreamRef = useRef<MediaStream | null>(null);
+  const activeCallRef = useRef<any>(null);
   const joinedRef = useRef(false);
   const hiddenJoinRef = useRef(false);
-  const peerConnectionsRef = useRef(new Map());
-  const peerUnsubsRef = useRef(new Map());
-  const processedCandidatesRef = useRef(new Map());
-  const pendingCandidatesRef = useRef(new Map());
-  const remoteDescriptionSetRef = useRef(new Set());
-  const answeredPairsRef = useRef(new Set());
+  const peerConnectionsRef = useRef<Map<string, RTCPeerConnection>>(new Map());
+  const peerUnsubsRef = useRef<Map<string, Array<() => void>>>(new Map());
+  const processedCandidatesRef = useRef<Map<string, Set<string>>>(new Map());
+  const pendingCandidatesRef = useRef<Map<string, RTCIceCandidate[]>>(new Map());
+  const remoteDescriptionSetRef = useRef<Set<string>>(new Set());
+  const answeredPairsRef = useRef<Set<string>>(new Set());
   const userId = user?.uid || "";
   const userName = user?.displayName || user?.email || "Member";
   const userPhotoURL = user?.photoURL || null;
@@ -78,25 +66,45 @@ export default function CallPanel({ roomId, room, user, isAdmin, isSystemAdmin }
   const canEndForEveryone = !!activeCall && (isCallCreator || isAdmin || isSystemAdmin);
 
   useEffect(() => {
-    const q = query(collection(db, "rooms", roomId, "calls"), where("status", "==", "active"));
-    const unsub = onSnapshot(
-      q,
-      (snap) => {
-        const calls = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-        calls.sort((a, b) => (b.createdAt?.seconds || 0) - (a.createdAt?.seconds || 0));
-        const nextCall = calls[0] || null;
-        activeCallRef.current = nextCall;
-        setActiveCall(nextCall);
-        if (!nextCall) {
-          setPanelOpen(false);
-          setParticipants([]);
-        }
-      },
-      () => {
-        setError("Couldn't load room calls. Check Firestore call rules.");
+    let active = true;
+
+    const loadActiveCall = async () => {
+      const { data, error: loadError } = await supabase
+        .from("calls")
+        .select("*")
+        .eq("room_id", roomId)
+        .eq("status", "active")
+        .order("created_at", { ascending: false })
+        .limit(1);
+      if (!active) return;
+      if (loadError) {
+        setError("Couldn't load room calls. Please try again.");
+        return;
       }
-    );
-    return () => unsub();
+      const nextCall = data && data[0] ? mapCall(data[0]) : null;
+      activeCallRef.current = nextCall;
+      setActiveCall(nextCall);
+      if (!nextCall) {
+        setPanelOpen(false);
+        setParticipants([]);
+      }
+    };
+
+    loadActiveCall();
+
+    const channel = supabase
+      .channel(`calls:${roomId}`)
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "calls", filter: `room_id=eq.${roomId}` },
+        () => loadActiveCall()
+      )
+      .subscribe();
+
+    return () => {
+      active = false;
+      supabase.removeChannel(channel);
+    };
   }, [roomId]);
 
   useEffect(() => {
@@ -107,16 +115,41 @@ export default function CallPanel({ roomId, room, user, isAdmin, isSystemAdmin }
       return undefined;
     }
 
-    const unsub = onSnapshot(
-      collection(db, "rooms", roomId, "calls", activeCall.id, "participants"),
-      (snap) => {
-        setParticipants(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
-      },
-      () => {
-        setError("Couldn't load call participants. Check Firestore call rules.");
+    let active = true;
+
+    const loadParticipants = async () => {
+      const { data, error: loadError } = await supabase
+        .from("call_participants")
+        .select("*")
+        .eq("call_id", activeCall.id);
+      if (!active) return;
+      if (loadError) {
+        setError("Couldn't load call participants. Please try again.");
+        return;
       }
-    );
-    return () => unsub();
+      setParticipants((data || []).map(mapParticipant));
+    };
+
+    loadParticipants();
+
+    const channel = supabase
+      .channel(`participants:${activeCall.id}`)
+      .on(
+        "postgres_changes",
+        {
+          event: "*",
+          schema: "public",
+          table: "call_participants",
+          filter: `call_id=eq.${activeCall.id}`,
+        },
+        () => loadParticipants()
+      )
+      .subscribe();
+
+    return () => {
+      active = false;
+      supabase.removeChannel(channel);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [roomId, activeCall?.id]);
 
@@ -184,14 +217,15 @@ export default function CallPanel({ roomId, room, user, isAdmin, isSystemAdmin }
       setError("");
 
       if (markLeft && call && wasJoined) {
-        await setDoc(
-          doc(db, "rooms", roomId, "calls", call.id, "participants", userId),
-          { leftAt: serverTimestamp(), updatedAt: serverTimestamp() },
-          { merge: true }
-        ).catch(() => {});
+        await supabase
+          .from("call_participants")
+          .update({ left_at: new Date().toISOString(), updated_at: new Date().toISOString() })
+          .eq("call_id", call.id)
+          .eq("uid", userId)
+          .then(() => {});
       }
     },
-    [cleanupPeers, roomId, stopLocalMedia, userId]
+    [cleanupPeers, stopLocalMedia, userId]
   );
 
   useEffect(() => {
@@ -243,95 +277,139 @@ export default function CallPanel({ roomId, room, user, isAdmin, isSystemAdmin }
         }
       };
 
-      const peerDoc = doc(db, "rooms", roomId, "calls", call.id, "peers", pairId);
-      const localCandidates = collection(peerDoc, isOfferer ? "offerCandidates" : "answerCandidates");
-      const remoteCandidates = collection(peerDoc, isOfferer ? "answerCandidates" : "offerCandidates");
+      const localKind = isOfferer ? "offer" : "answer";
+      const remoteKind = isOfferer ? "answer" : "offer";
 
       pc.onicecandidate = (event) => {
         if (event.candidate) {
-          addDoc(localCandidates, event.candidate.toJSON()).catch(() => {});
+          supabase
+            .from("call_ice_candidates")
+            .insert({
+              call_id: call.id,
+              pair_id: pairId,
+              kind: localKind,
+              candidate: event.candidate.toJSON(),
+            })
+            .then(() => {});
         }
       };
 
-      const candidateUnsub = onSnapshot(
-        remoteCandidates,
-        (snap) => {
-          const seen = processedCandidatesRef.current.get(pairId) || new Set();
-          snap.docChanges().forEach((change) => {
-            if (change.type !== "added" || seen.has(change.doc.id)) return;
-            seen.add(change.doc.id);
-            addOrQueueRemoteCandidate(pairId, pc, change.doc.data()).catch(() => {});
-          });
-          processedCandidatesRef.current.set(pairId, seen);
-        },
-        () => {
-          setError("Couldn't exchange call network candidates. Check Firestore call rules.");
-        }
-      );
+      const handleRemoteCandidate = (row) => {
+        if (!row || row.call_id !== call.id || row.kind !== remoteKind) return;
+        const seen = processedCandidatesRef.current.get(pairId) || new Set();
+        if (seen.has(row.id)) return;
+        seen.add(row.id);
+        processedCandidatesRef.current.set(pairId, seen);
+        addOrQueueRemoteCandidate(pairId, pc, row.candidate).catch(() => {});
+      };
 
-      const peerUnsub = onSnapshot(
-        peerDoc,
-        async (snap) => {
-          if (!snap.exists()) return;
-          const data = snap.data();
+      const handlePeerRow = async (data) => {
+        if (!data || data.call_id !== call.id) return;
 
-          if (isOfferer && data.answer && !remoteDescriptionSetRef.current.has(pairId)) {
-            remoteDescriptionSetRef.current.add(pairId);
-            try {
-              await pc.setRemoteDescription(new RTCSessionDescription(data.answer));
-              await flushPendingCandidates(pairId, pc);
-            } catch {
-              remoteDescriptionSetRef.current.delete(pairId);
-            }
+        if (isOfferer && data.answer && !remoteDescriptionSetRef.current.has(pairId)) {
+          remoteDescriptionSetRef.current.add(pairId);
+          try {
+            await pc.setRemoteDescription(new RTCSessionDescription(data.answer));
+            await flushPendingCandidates(pairId, pc);
+          } catch {
+            remoteDescriptionSetRef.current.delete(pairId);
           }
-
-          if (!isOfferer && data.offer && !answeredPairsRef.current.has(pairId)) {
-            answeredPairsRef.current.add(pairId);
-            try {
-              await pc.setRemoteDescription(new RTCSessionDescription(data.offer));
-              await flushPendingCandidates(pairId, pc);
-              const answer = await pc.createAnswer();
-              await pc.setLocalDescription(answer);
-              await setDoc(
-                peerDoc,
-                {
-                  answer: toPlainDescription(answer),
-                  answererUid: userId,
-                  updatedAt: serverTimestamp(),
-                },
-                { merge: true }
-              );
-            } catch {
-              answeredPairsRef.current.delete(pairId);
-            }
-          }
-        },
-        () => {
-          setError("Couldn't exchange call offers. Check Firestore call rules.");
         }
-      );
 
-      peerUnsubsRef.current.set(remoteParticipant.uid, [candidateUnsub, peerUnsub]);
+        if (!isOfferer && data.offer && !answeredPairsRef.current.has(pairId)) {
+          answeredPairsRef.current.add(pairId);
+          try {
+            await pc.setRemoteDescription(new RTCSessionDescription(data.offer));
+            await flushPendingCandidates(pairId, pc);
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+            await supabase
+              .from("call_peers")
+              .update({
+                answer: toPlainDescription(answer),
+                answerer_uid: userId,
+                updated_at: new Date().toISOString(),
+              })
+              .eq("call_id", call.id)
+              .eq("pair_id", pairId)
+              .then(() => {});
+          } catch {
+            answeredPairsRef.current.delete(pairId);
+          }
+        }
+      };
+
+      const channel = supabase
+        .channel(`peer:${call.id}:${pairId}:${userId}`)
+        .on(
+          "postgres_changes",
+          {
+            event: "INSERT",
+            schema: "public",
+            table: "call_ice_candidates",
+            filter: `pair_id=eq.${pairId}`,
+          },
+          (payload) => handleRemoteCandidate(payload.new)
+        )
+        .on(
+          "postgres_changes",
+          {
+            event: "*",
+            schema: "public",
+            table: "call_peers",
+            filter: `pair_id=eq.${pairId}`,
+          },
+          (payload) => {
+            if (payload.eventType !== "DELETE") handlePeerRow(payload.new);
+          }
+        )
+        .subscribe();
+
+      peerUnsubsRef.current.set(remoteParticipant.uid, [
+        () => supabase.removeChannel(channel),
+      ]);
+
+      // Catch up on any signaling that already landed before the subscription.
+      const { data: existingPeer } = await supabase
+        .from("call_peers")
+        .select("*")
+        .eq("call_id", call.id)
+        .eq("pair_id", pairId)
+        .maybeSingle();
+
+      const { data: existingCandidates } = await supabase
+        .from("call_ice_candidates")
+        .select("*")
+        .eq("call_id", call.id)
+        .eq("pair_id", pairId)
+        .eq("kind", remoteKind);
+      (existingCandidates || []).forEach(handleRemoteCandidate);
 
       if (isOfferer) {
-        const existing = await getDoc(peerDoc);
-        if (!existing.exists() || !existing.data()?.offer) {
+        if (!existingPeer || !existingPeer.offer) {
           const offer = await pc.createOffer();
           await pc.setLocalDescription(offer);
-          await setDoc(
-            peerDoc,
-            {
-              offer: toPlainDescription(offer),
-              offererUid: userId,
-              answererUid: remoteParticipant.uid,
-              updatedAt: serverTimestamp(),
-            },
-            { merge: true }
-          );
+          await supabase
+            .from("call_peers")
+            .upsert(
+              {
+                call_id: call.id,
+                pair_id: pairId,
+                offer: toPlainDescription(offer),
+                offerer_uid: userId,
+                answerer_uid: remoteParticipant.uid,
+                updated_at: new Date().toISOString(),
+              },
+              { onConflict: "call_id,pair_id" }
+            )
+            .then(() => {});
         }
+      } else if (existingPeer) {
+        // Offer may already be present; process it right away.
+        handlePeerRow(existingPeer);
       }
     },
-    [addOrQueueRemoteCandidate, flushPendingCandidates, roomId, userId]
+    [addOrQueueRemoteCandidate, flushPendingCandidates, userId]
   );
 
   useEffect(() => {
@@ -355,7 +433,7 @@ export default function CallPanel({ roomId, room, user, isAdmin, isSystemAdmin }
     });
   }, [activeCall, createPeerConnection, joined, participants, userId]);
 
-  const joinCall = async (call, mode = "normal", options = {}) => {
+  const joinCall = async (call: any, mode = "normal", options: { ignoreJoining?: boolean } = {}) => {
     if (!call || (joining && !options.ignoreJoining)) return;
     if (typeof window === "undefined" || !window.RTCPeerConnection || !navigator.mediaDevices?.getUserMedia) {
       setError("This browser does not support audio/video calls.");
@@ -390,22 +468,22 @@ export default function CallPanel({ roomId, room, user, isAdmin, isSystemAdmin }
         setCameraOff(call.type !== "video");
       }
 
-      await setDoc(
-        doc(db, "rooms", roomId, "calls", call.id, "participants", userId),
+      await supabase.from("call_participants").upsert(
         {
+          call_id: call.id,
           uid: userId,
-          displayName: userName,
-          photoURL: userPhotoURL,
+          display_name: userName,
+          photo_url: userPhotoURL,
           hidden,
           role: hidden ? "admin" : "normal",
           muted: hidden ? true : false,
-          cameraOff: hidden ? true : call.type !== "video",
-          screenSharing: false,
-          joinedAt: serverTimestamp(),
-          leftAt: null,
-          updatedAt: serverTimestamp(),
+          camera_off: hidden ? true : call.type !== "video",
+          screen_sharing: false,
+          joined_at: new Date().toISOString(),
+          left_at: null,
+          updated_at: new Date().toISOString(),
         },
-        { merge: true }
+        { onConflict: "call_id,uid" }
       );
 
       joinedRef.current = true;
@@ -429,30 +507,26 @@ export default function CallPanel({ roomId, room, user, isAdmin, isSystemAdmin }
     setJoining(true);
     setError("");
     try {
-      const callRef = await addDoc(collection(db, "rooms", roomId, "calls"), {
-        roomId,
-        roomName: room?.name || "Room",
-        type,
-        status: "active",
-        createdBy: userId,
-        createdByName: userName,
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
-      });
+      const { data, error: insertError } = await supabase
+        .from("calls")
+        .insert({
+          room_id: roomId,
+          room_name: room?.name || "Room",
+          type,
+          status: "active",
+          created_by: userId,
+          created_by_name: userName,
+        })
+        .select()
+        .single();
+      if (insertError) throw insertError;
 
-      const call = {
-        id: callRef.id,
-        roomId,
-        type,
-        status: "active",
-        createdBy: userId,
-        createdByName: userName,
-      };
+      const call = mapCall(data);
       activeCallRef.current = call;
       setActiveCall(call);
       await joinCall(call, "normal", { ignoreJoining: true });
     } catch {
-      setError("Couldn't start the call. Check Firestore rules and browser permissions.");
+      setError("Couldn't start the call. Please check your browser permissions and try again.");
     } finally {
       setJoining(false);
     }
@@ -465,11 +539,12 @@ export default function CallPanel({ roomId, room, user, isAdmin, isSystemAdmin }
       track.enabled = !nextMuted;
     });
     if (activeCall) {
-      await setDoc(
-        doc(db, "rooms", roomId, "calls", activeCall.id, "participants", userId),
-        { muted: nextMuted, updatedAt: serverTimestamp() },
-        { merge: true }
-      ).catch(() => {});
+      await supabase
+        .from("call_participants")
+        .update({ muted: nextMuted, updated_at: new Date().toISOString() })
+        .eq("call_id", activeCall.id)
+        .eq("uid", userId)
+        .then(() => {});
     }
   };
 
@@ -480,11 +555,12 @@ export default function CallPanel({ roomId, room, user, isAdmin, isSystemAdmin }
       track.enabled = !nextCameraOff;
     });
     if (activeCall) {
-      await setDoc(
-        doc(db, "rooms", roomId, "calls", activeCall.id, "participants", userId),
-        { cameraOff: nextCameraOff, updatedAt: serverTimestamp() },
-        { merge: true }
-      ).catch(() => {});
+      await supabase
+        .from("call_participants")
+        .update({ camera_off: nextCameraOff, updated_at: new Date().toISOString() })
+        .eq("call_id", activeCall.id)
+        .eq("uid", userId)
+        .then(() => {});
     }
   };
 
@@ -504,11 +580,12 @@ export default function CallPanel({ roomId, room, user, isAdmin, isSystemAdmin }
     await replaceVideoTrack(cameraTrack);
     setScreenSharing(false);
     if (activeCall) {
-      await setDoc(
-        doc(db, "rooms", roomId, "calls", activeCall.id, "participants", userId),
-        { screenSharing: false, updatedAt: serverTimestamp() },
-        { merge: true }
-      ).catch(() => {});
+      await supabase
+        .from("call_participants")
+        .update({ screen_sharing: false, updated_at: new Date().toISOString() })
+        .eq("call_id", activeCall.id)
+        .eq("uid", userId)
+        .then(() => {});
     }
   };
 
@@ -525,11 +602,12 @@ export default function CallPanel({ roomId, room, user, isAdmin, isSystemAdmin }
       setScreenSharing(true);
       screenTrack.onended = () => stopScreenShare();
       if (activeCall) {
-        await setDoc(
-          doc(db, "rooms", roomId, "calls", activeCall.id, "participants", userId),
-          { screenSharing: true, updatedAt: serverTimestamp() },
-          { merge: true }
-        ).catch(() => {});
+        await supabase
+          .from("call_participants")
+          .update({ screen_sharing: true, updated_at: new Date().toISOString() })
+          .eq("call_id", activeCall.id)
+          .eq("uid", userId)
+          .then(() => {});
       }
     } catch {
       setError("Screen sharing was cancelled or blocked by the browser.");
@@ -538,12 +616,16 @@ export default function CallPanel({ roomId, room, user, isAdmin, isSystemAdmin }
 
   const endForEveryone = async () => {
     if (!activeCall || !canEndForEveryone) return;
-    await updateDoc(doc(db, "rooms", roomId, "calls", activeCall.id), {
-      status: "ended",
-      endedBy: userId,
-      endedAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
-    }).catch(() => {});
+    await supabase
+      .from("calls")
+      .update({
+        status: "ended",
+        ended_by: userId,
+        ended_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", activeCall.id)
+      .then(() => {});
     await leaveCurrentCall({ markLeft: true });
   };
 
@@ -765,8 +847,8 @@ function VideoIcon() {
   );
 }
 
-function RemoteMediaTile({ participant, stream, type, speakerOn }) {
-  const videoRef = useRef(null);
+function RemoteMediaTile({ participant, stream, type, speakerOn }: any) {
+  const videoRef = useRef<any>(null);
 
   useEffect(() => {
     if (videoRef.current && stream) {
@@ -804,7 +886,7 @@ function RemoteMediaTile({ participant, stream, type, speakerOn }) {
   );
 }
 
-function ParticipantPlaceholder({ participant, label }) {
+function ParticipantPlaceholder({ participant, label }: any) {
   return (
     <div className="flex min-h-40 h-full w-full flex-col items-center justify-center gap-3 p-6 text-center">
       <UserAvatar name={participant?.displayName || label} photoURL={participant?.photoURL} size="lg" />
@@ -813,7 +895,7 @@ function ParticipantPlaceholder({ participant, label }) {
   );
 }
 
-function TileLabel({ name, muted, cameraOff, screenSharing }) {
+function TileLabel({ name, muted, cameraOff, screenSharing }: any) {
   return (
     <div className="absolute bottom-2 left-2 right-2 flex items-center justify-between gap-2 rounded-lg bg-black/55 px-2 py-1 backdrop-blur">
       <span className="truncate text-xs text-white">{name}</span>

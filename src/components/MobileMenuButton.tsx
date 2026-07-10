@@ -2,7 +2,15 @@
 
 import { useSidebar } from "@/context/SidebarContext";
 
-export default function MobileMenuButton({ variant = "menu", className = "" }) {
+interface MobileMenuButtonProps {
+  variant?: "menu" | "back";
+  className?: string;
+}
+
+export default function MobileMenuButton({
+  variant = "menu",
+  className = "",
+}: MobileMenuButtonProps) {
   const { openMobile } = useSidebar();
 
   return (

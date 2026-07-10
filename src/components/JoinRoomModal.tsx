@@ -2,12 +2,14 @@
 
 import { useState } from "react";
 import { useRouter } from "next/navigation";
-import { doc, getDoc, setDoc, updateDoc, arrayUnion, serverTimestamp } from "firebase/firestore";
-import { db } from "@/lib/firebase";
+import { supabase } from "@/lib/supabase";
+import { mapRoom } from "@/lib/mappers";
 import { useAuth } from "@/context/AuthContext";
 import { sha256Hex } from "@/lib/hash";
 import { isSystemAdminEmail } from "@/lib/systemAdmin";
 import PasswordInput from "@/components/PasswordInput";
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 // step: "search" | "public-found" | "passcode" | "approval-request" | "approval-pending" | "already-member"
 export default function JoinRoomModal({ onClose }) {
@@ -35,13 +37,23 @@ export default function JoinRoomModal({ onClose }) {
     setError("");
     setLoading(true);
     try {
-      const snap = await getDoc(doc(db, "rooms", trimmed));
-      if (!snap.exists()) {
+      if (!UUID_RE.test(trimmed)) {
         setError("No room found with that ID.");
         setRoom(null);
         return;
       }
-      const data = { id: snap.id, ...snap.data() };
+
+      const { data: roomRow } = await supabase
+        .from("rooms")
+        .select("*")
+        .eq("id", trimmed)
+        .maybeSingle();
+      if (!roomRow) {
+        setError("No room found with that ID.");
+        setRoom(null);
+        return;
+      }
+      const data = mapRoom(roomRow);
       setRoom(data);
 
       if (data.members?.includes(user.uid) || data.admins?.includes(user.uid)) {
@@ -51,8 +63,13 @@ export default function JoinRoomModal({ onClose }) {
       } else if (data.privacy === "passcode") {
         setStep("passcode");
       } else {
-        const reqSnap = await getDoc(doc(db, "rooms", data.id, "joinRequests", user.uid));
-        setStep(reqSnap.exists() ? "approval-pending" : "approval-request");
+        const { data: reqRow } = await supabase
+          .from("join_requests")
+          .select("uid")
+          .eq("room_id", data.id)
+          .eq("uid", user.uid)
+          .maybeSingle();
+        setStep(reqRow ? "approval-pending" : "approval-request");
       }
     } catch (err) {
       setError("Something went wrong looking that up.");
@@ -65,7 +82,11 @@ export default function JoinRoomModal({ onClose }) {
     setLoading(true);
     setError("");
     try {
-      await updateDoc(doc(db, "rooms", room.id), { members: arrayUnion(user.uid) });
+      const { error: rpcError } = await supabase.rpc("join_room", {
+        p_room_id: room.id,
+        p_passcode_hash: null,
+      });
+      if (rpcError) throw rpcError;
       enterRoom(room.id);
     } catch (err) {
       setError("Couldn't join that room. Try again.");
@@ -79,10 +100,13 @@ export default function JoinRoomModal({ onClose }) {
     setAdminJoining(true);
     setError("");
     try {
-      await updateDoc(doc(db, "rooms", room.id), { admins: arrayUnion(user.uid) });
+      const { error: rpcError } = await supabase.rpc("join_room_as_admin", {
+        p_room_id: room.id,
+      });
+      if (rpcError) throw rpcError;
       enterRoom(room.id);
     } catch (err) {
-      setError("Couldn't join as admin. Check your Firestore rules and try again.");
+      setError("Couldn't join as admin. Try again.");
     } finally {
       setAdminJoining(false);
     }
@@ -98,7 +122,11 @@ export default function JoinRoomModal({ onClose }) {
         setError("Incorrect passcode.");
         return;
       }
-      await updateDoc(doc(db, "rooms", room.id), { members: arrayUnion(user.uid) });
+      const { error: rpcError } = await supabase.rpc("join_room", {
+        p_room_id: room.id,
+        p_passcode_hash: hash,
+      });
+      if (rpcError) throw rpcError;
       enterRoom(room.id);
     } catch (err) {
       setError("Couldn't join that room. Try again.");
@@ -111,12 +139,16 @@ export default function JoinRoomModal({ onClose }) {
     setLoading(true);
     setError("");
     try {
-      await setDoc(doc(db, "rooms", room.id, "joinRequests", user.uid), {
-        uid: user.uid,
-        displayName: user.displayName || user.email,
-        photoURL: user.photoURL || null,
-        requestedAt: serverTimestamp(),
-      });
+      const { error: insertError } = await supabase.from("join_requests").upsert(
+        {
+          room_id: room.id,
+          uid: user.uid,
+          display_name: user.displayName || user.email,
+          photo_url: user.photoURL || null,
+        },
+        { onConflict: "room_id,uid" }
+      );
+      if (insertError) throw insertError;
       setStep("approval-pending");
     } catch (err) {
       setError("Couldn't send your request. Try again.");
@@ -264,7 +296,7 @@ function Confirm({
   adminActionLabel,
   onAdminAction,
   adminDisabled,
-}) {
+}: any) {
   return (
     <div className="space-y-3">
       <div>

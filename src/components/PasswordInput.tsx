@@ -1,6 +1,17 @@
 "use client";
 
-import { useState } from "react";
+import { useState, type ChangeEvent } from "react";
+
+interface PasswordInputProps {
+  value: string;
+  onChange: (e: ChangeEvent<HTMLInputElement>) => void;
+  placeholder?: string;
+  autoComplete?: string;
+  minLength?: number;
+  required?: boolean;
+  autoFocus?: boolean;
+  className?: string;
+}
 
 export default function PasswordInput({
   value,
@@ -11,7 +22,7 @@ export default function PasswordInput({
   required,
   autoFocus,
   className = "",
-}) {
+}: PasswordInputProps) {
   const [visible, setVisible] = useState(false);
 
   return (

@@ -1,21 +1,13 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import {
-  doc,
-  getDoc,
-  updateDoc,
-  deleteDoc,
-  arrayUnion,
-  arrayRemove,
-  collection,
-  query,
-  where,
-  getDocs,
-  onSnapshot,
-} from "firebase/firestore";
-import { db } from "@/lib/firebase";
+import { useCallback, useEffect, useState } from "react";
+import { supabase } from "@/lib/supabase";
+import { mapJoinRequest, mapProfile } from "@/lib/mappers";
 import { useAuth } from "@/context/AuthContext";
+
+// Deduplicated array helpers so we can update the uuid[] columns in place.
+const withValue = (arr, value) => Array.from(new Set([...(arr || []), value]));
+const withoutValue = (arr, value) => (arr || []).filter((v) => v !== value);
 
 export default function RoomAdminPanel({ room, onClose }) {
   const { user } = useAuth();
@@ -28,8 +20,9 @@ export default function RoomAdminPanel({ room, onClose }) {
   const [busyUid, setBusyUid] = useState(null);
   const [addBusy, setAddBusy] = useState(false);
 
-  const roomRef = doc(db, "rooms", room.id);
   const isLastAdmin = room.admins.length <= 1;
+
+  const updateRoom = (patch) => supabase.from("rooms").update(patch).eq("id", room.id);
 
   const memberKey = room.members.join(",");
 
@@ -40,14 +33,18 @@ export default function RoomAdminPanel({ room, onClose }) {
   // Load display info for every current member.
   useEffect(() => {
     let active = true;
-    Promise.all(
-      room.members.map(async (uid) => {
-        const snap = await getDoc(doc(db, "users", uid));
-        return [uid, snap.exists() ? snap.data() : { displayName: "Unknown", photoURL: null }];
-      })
-    ).then((entries) => {
-      if (active) setProfiles(Object.fromEntries(entries));
-    });
+    supabase
+      .from("profiles")
+      .select("*")
+      .in("id", room.members.length ? room.members : ["00000000-0000-0000-0000-000000000000"])
+      .then(({ data }) => {
+        if (!active) return;
+        const map = {};
+        (data || []).forEach((row) => {
+          map[row.id] = mapProfile(row);
+        });
+        setProfiles(map);
+      });
     return () => {
       active = false;
     };
@@ -55,18 +52,34 @@ export default function RoomAdminPanel({ room, onClose }) {
   }, [memberKey, room.id]);
 
   // Live join requests, only relevant for approval-gated rooms.
+  const loadRequests = useCallback(async () => {
+    const { data } = await supabase
+      .from("join_requests")
+      .select("*")
+      .eq("room_id", room.id);
+    setRequests((data || []).map(mapJoinRequest));
+  }, [room.id]);
+
   useEffect(() => {
-    if (room.privacy !== "approval") return;
-    const unsub = onSnapshot(collection(db, "rooms", room.id, "joinRequests"), (snap) => {
-      setRequests(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
-    });
-    return () => unsub();
-  }, [room.id, room.privacy]);
+    if (room.privacy !== "approval") return undefined;
+    loadRequests();
+    const channel = supabase
+      .channel(`join-requests:${room.id}`)
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "join_requests", filter: `room_id=eq.${room.id}` },
+        () => loadRequests()
+      )
+      .subscribe();
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [room.id, room.privacy, loadRequests]);
 
   const promote = async (uid) => {
     setBusyUid(uid);
     try {
-      await updateDoc(roomRef, { admins: arrayUnion(uid) });
+      await updateRoom({ admins: withValue(room.admins, uid) });
     } finally {
       setBusyUid(null);
     }
@@ -79,7 +92,7 @@ export default function RoomAdminPanel({ room, onClose }) {
     }
     setBusyUid(uid);
     try {
-      await updateDoc(roomRef, { admins: arrayRemove(uid) });
+      await updateRoom({ admins: withoutValue(room.admins, uid) });
     } finally {
       setBusyUid(null);
     }
@@ -92,7 +105,10 @@ export default function RoomAdminPanel({ room, onClose }) {
     }
     setBusyUid(uid);
     try {
-      await updateDoc(roomRef, { members: arrayRemove(uid), admins: arrayRemove(uid) });
+      await updateRoom({
+        members: withoutValue(room.members, uid),
+        admins: withoutValue(room.admins, uid),
+      });
     } finally {
       setBusyUid(null);
     }
@@ -106,7 +122,8 @@ export default function RoomAdminPanel({ room, onClose }) {
     setRenamingRoom(true);
     setError("");
     try {
-      await updateDoc(roomRef, { name: nextName });
+      const { error: updateError } = await updateRoom({ name: nextName });
+      if (updateError) throw updateError;
     } catch {
       setError("Couldn't rename the room. Try again.");
     } finally {
@@ -121,17 +138,23 @@ export default function RoomAdminPanel({ room, onClose }) {
     setAddBusy(true);
     setError("");
     try {
-      const snap = await getDocs(query(collection(db, "users"), where("email", "==", email)));
-      if (snap.empty) {
+      const { data: target } = await supabase
+        .from("profiles")
+        .select("id")
+        .ilike("email", email)
+        .maybeSingle();
+      if (!target) {
         setError("No user found with that email.");
         return;
       }
-      const target = snap.docs[0];
       if (room.members.includes(target.id)) {
         setError("That person is already a member.");
         return;
       }
-      await updateDoc(roomRef, { members: arrayUnion(target.id) });
+      const { error: updateError } = await updateRoom({
+        members: withValue(room.members, target.id),
+      });
+      if (updateError) throw updateError;
       setAddEmail("");
     } catch (err) {
       setError("Couldn't add that person. Try again.");
@@ -143,8 +166,8 @@ export default function RoomAdminPanel({ room, onClose }) {
   const approve = async (uid) => {
     setBusyUid(uid);
     try {
-      await updateDoc(roomRef, { members: arrayUnion(uid) });
-      await deleteDoc(doc(db, "rooms", room.id, "joinRequests", uid));
+      await updateRoom({ members: withValue(room.members, uid) });
+      await supabase.from("join_requests").delete().eq("room_id", room.id).eq("uid", uid);
     } finally {
       setBusyUid(null);
     }
@@ -153,7 +176,7 @@ export default function RoomAdminPanel({ room, onClose }) {
   const deny = async (uid) => {
     setBusyUid(uid);
     try {
-      await deleteDoc(doc(db, "rooms", room.id, "joinRequests", uid));
+      await supabase.from("join_requests").delete().eq("room_id", room.id).eq("uid", uid);
     } finally {
       setBusyUid(null);
     }

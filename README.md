@@ -1,20 +1,23 @@
-# PriChat — Realtime Chat (Next.js + Firebase)
+# PriChat — Realtime Chat (Next.js + Supabase)
 
 A fully working multi-user chat app: email/password and Google sign-in, multiple
-chat rooms, realtime messaging, and basic presence — built with Next.js (App Router),
-Tailwind CSS, and Firebase (Auth + Firestore).
+chat rooms, realtime messaging, voice messages, audio/video calls, and basic
+presence — built with Next.js (App Router), Tailwind CSS, and Supabase
+(Auth + Postgres + Realtime + Storage).
 
 ## What's included
 
-- Email/password and Google OAuth sign-in (Firebase Auth)
+- Email/password and Google OAuth sign-in (Supabase Auth)
 - Create rooms with three privacy levels: **public**, **passcode**, or **admin approval**
 - Find any room — including private ones — by pasting its room ID ("Join by ID")
 - Per-room admins: the creator starts as admin and can promote/demote other members,
   remove members, add someone directly by their account email, and approve or deny
   join requests
-- Realtime messages (Firestore `onSnapshot`, no refresh needed)
+- Realtime messages (Supabase Realtime `postgres_changes`, no refresh needed)
+- Voice messages (recorded in-browser, stored in Supabase Storage)
+- Audio/video calls with WebRTC signaling over Supabase tables
 - Emoji picker inside the message input
-- Message deletion for the sender and room admins
+- Message editing and deletion for the sender and room admins
 - Show/hide toggle on every password and passcode field
 - Basic presence (online dot + "last seen" heartbeat)
 - Responsive layout with a collapsible sidebar on mobile
@@ -26,149 +29,69 @@ Tailwind CSS, and Firebase (Auth + Firestore).
 npm install
 ```
 
-## 2. Create a Firebase project
+## 2. Create a Supabase project
 
-1. Go to [console.firebase.google.com](https://console.firebase.google.com) and create a new project.
-2. In **Build → Authentication → Sign-in method**, enable:
-   - **Email/Password**
-   - **Google**
-3. In **Build → Firestore Database**, click **Create database** and start in **production mode**.
-4. In **Project settings → General**, scroll to "Your apps", click the **Web** icon
-   (`</>`) to register a web app, and copy the config values it gives you.
+1. Go to [supabase.com/dashboard](https://supabase.com/dashboard) and create a new project.
+2. In **Authentication → Providers**, enable:
+   - **Email** (for parity with the old app, turn **Confirm email** off under
+     Authentication → Providers → Email so new sign-ups are logged in immediately)
+   - **Google** (add your Google OAuth client ID/secret)
+3. In **Project Settings → API**, copy the **Project URL** and the **anon/public**
+   (a.k.a. publishable) API key.
 
-## 3. Add your Firebase config
+## 3. Add your Supabase config
 
-Copy the example env file:
-
-```bash
-cp .env.local.example .env.local
-```
-
-Fill in `.env.local` with the values from step 2:
+Fill in `.env.local`:
 
 ```
-NEXT_PUBLIC_FIREBASE_API_KEY=...
-NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN=...
-NEXT_PUBLIC_FIREBASE_PROJECT_ID=...
-NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET=...
-NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID=...
-NEXT_PUBLIC_FIREBASE_APP_ID=...
+NEXT_PUBLIC_SUPABASE_URL=https://<your-project-ref>.supabase.co
+NEXT_PUBLIC_SUPABASE_ANON_KEY=<your-anon-publishable-key>
 ```
 
-These are all prefixed `NEXT_PUBLIC_` because they're needed in the browser —
-this is normal and safe for Firebase client config (your Firestore **security rules**
-are what actually protect your data, not these keys being hidden).
+Both are prefixed `NEXT_PUBLIC_` because they're needed in the browser — this is
+normal and safe for the Supabase anon key. Your **Row Level Security (RLS)**
+policies are what actually protect your data, not these keys being hidden.
 
-## 4. Set Firestore security rules
+## 4. Apply the database schema
 
-In the Firebase console, go to **Firestore Database → Rules** and paste this in. I also included the same rules in `firestore.rules` for easier copying:
+Open **SQL Editor** in the Supabase dashboard and run the contents of
+[`supabase/schema.sql`](supabase/schema.sql). It's idempotent, so you can re-run
+it safely. It creates:
 
-```
-rules_version = '2';
-service cloud.firestore {
-  match /databases/{database}/documents {
+- Tables: `profiles`, `rooms`, `messages`, `join_requests`, `calls`,
+  `call_participants`, `call_peers`, `call_ice_candidates`
+- Security-definer helper functions (`is_system_admin`, `is_room_member`,
+  `is_room_admin`, `is_call_member`)
+- Membership RPCs (`join_room`, `join_room_as_admin`, `leave_room`) so non-admins
+  can self-join / self-leave while direct room updates stay admin-only
+- A trigger that auto-creates a `profiles` row when a user signs up
+- Row Level Security policies on every table
+- The realtime publication for all live tables
+- A public `voice` Storage bucket (for voice-message uploads) and its policies
 
-    match /users/{userId} {
-      allow read: if request.auth != null;
-      allow write: if request.auth != null && request.auth.uid == userId;
-    }
-
-    match /rooms/{roomId} {
-      // Room metadata (name, privacy type, member/admin lists, and the
-      // passcode's hash) is readable by any signed-in user, so "Join by ID"
-      // can look a room up before you're a member. Message content below is
-      // still locked to members only.
-      allow read: if request.auth != null;
-
-      allow create: if request.auth != null
-        && request.resource.data.createdBy == request.auth.uid
-        && request.resource.data.admins == [request.auth.uid]
-        && request.resource.data.members == [request.auth.uid];
-
-      allow update: if request.auth != null && (
-        request.auth.uid in resource.data.admins ||
-        isSelfJoin() ||
-        isSelfLeave()
-      );
-
-      allow delete: if request.auth != null && request.auth.uid in resource.data.admins;
-
-      function isSelfJoin() {
-        return resource.data.privacy in ["public", "passcode"]
-          && request.resource.data.members.hasAll(resource.data.members)
-          && request.resource.data.members.hasAny([request.auth.uid])
-          && request.resource.data.members.size() == resource.data.members.size() + 1
-          && request.resource.data.admins == resource.data.admins
-          && request.resource.data.name == resource.data.name
-          && request.resource.data.privacy == resource.data.privacy;
-      }
-
-      function isSelfLeave() {
-        return resource.data.members.hasAny([request.auth.uid])
-          && !request.resource.data.members.hasAny([request.auth.uid])
-          && resource.data.members.hasAll(request.resource.data.members)
-          && request.resource.data.members.size() == resource.data.members.size() - 1
-          && request.resource.data.admins == resource.data.admins
-          && request.resource.data.name == resource.data.name
-          && request.resource.data.privacy == resource.data.privacy;
-      }
-
-      match /joinRequests/{uid} {
-        allow create: if request.auth != null
-          && request.auth.uid == uid
-          && request.resource.data.uid == request.auth.uid;
-        allow read: if request.auth != null && (
-          request.auth.uid == uid ||
-          request.auth.uid in get(/databases/$(database)/documents/rooms/$(roomId)).data.admins
-        );
-        allow delete: if request.auth != null && (
-          request.auth.uid == uid ||
-          request.auth.uid in get(/databases/$(database)/documents/rooms/$(roomId)).data.admins
-        );
-      }
-
-      match /messages/{messageId} {
-        allow read: if request.auth != null
-          && request.auth.uid in get(/databases/$(database)/documents/rooms/$(roomId)).data.members;
-        allow create: if request.auth != null
-          && request.auth.uid == request.resource.data.uid
-          && request.auth.uid in get(/databases/$(database)/documents/rooms/$(roomId)).data.members;
-        allow update: if false;
-        allow delete: if request.auth != null
-          && request.auth.uid in get(/databases/$(database)/documents/rooms/$(roomId)).data.members
-          && (
-            request.auth.uid == resource.data.uid ||
-            request.auth.uid in get(/databases/$(database)/documents/rooms/$(roomId)).data.admins
-          );
-      }
-    }
-  }
-}
-```
-
-What this enforces:
+What the RLS model enforces:
 
 - Only signed-in users can read or write anything.
-- A room's **members** array is the actual access gate for its messages — admins
-  manage it freely; non-admins can only add or remove *themselves*.
-- Public and passcode rooms let any signed-in user add themselves to `members`.
-  Approval rooms don't — joining requires an admin to move you from
-  `joinRequests` into `members`.
-- Only people in a room's `admins` array can promote/demote, remove members,
-  delete the room, or manage join requests.
-- Messages can be deleted by their sender or by a room admin. Editing stays disabled.
+- A room's **members** array is the access gate for its messages, calls, and
+  participants. Admins manage membership freely; non-admins can only add or
+  remove *themselves*, and only through the `join_room` / `leave_room` RPCs.
+- Public and passcode rooms let any signed-in user join (passcode verified by a
+  server-side hash comparison inside `join_room`). Approval rooms require an admin
+  to move a request from `join_requests` into `members`.
+- Only people in a room's `admins` array (or the system admin) can promote/demote,
+  remove members, rename or delete the room, or manage join requests.
+- Messages can be edited/deleted by their sender or a room admin.
 
 **Security note on passcodes:** the passcode itself is never stored — only its
-SHA-256 hash, computed in the browser. The app verifies passcodes client-side
-(your browser hashes what you type and compares it to the stored hash) rather
-than in the security rules, because Firestore rules can't run a hash
-comparison against arbitrary input. This means someone bypassing the UI and
-talking to the Firestore API directly could theoretically add themselves to a
-passcode room without knowing the code — same as most client-side passcode
-gates without a backend. If you need that fully airtight, the join logic
-should move into a Cloud Function that verifies the passcode server-side
-before touching `members`. For a personal or small-team chat app this
-client-side check is a reasonable trade-off.
+SHA-256 hash, computed in the browser. Unlike the old Firestore build, the
+passcode is now verified **server-side** inside the `join_room` RPC (a security
+definer function), so the client can't bypass the check by talking to the API
+directly.
+
+The **system admin** email is defined in
+[`src/lib/systemAdmin.js`](src/lib/systemAdmin.js) and mirrored in
+`schema.sql` (`is_system_admin()`). Change both if you want a different system
+admin account.
 
 ## 5. Run it
 
@@ -184,10 +107,11 @@ window with a second account to see messages arrive in realtime.
 
 This is a standard Next.js app, so it deploys cleanly to
 [Vercel](https://vercel.com): push to a Git repo, import it in Vercel, and add
-the same `NEXT_PUBLIC_FIREBASE_*` environment variables in the project settings.
+the same `NEXT_PUBLIC_SUPABASE_*` environment variables in the project settings.
 
-Also, in the Firebase console under **Authentication → Settings → Authorized domains**,
-add your production domain (and Vercel preview domain) so sign-in works there too.
+In the Supabase dashboard under **Authentication → URL Configuration**, add your
+production domain (and Vercel preview domains) to the redirect allow-list so
+Google sign-in works there too.
 
 ## Project structure
 
@@ -200,19 +124,24 @@ src/
     chat/
       layout.js              Auth guard + sidebar shell
       page.js                 Empty state ("pick a room")
-      [roomId]/page.js        A single room: messages, input, admin entry point
+      [roomId]/page.js        A single room: messages, input, calls, admin entry
   components/
     Sidebar.jsx              Your rooms, public room discovery, create/join, logout
     CreateRoomModal.jsx       New room form (name + privacy type)
     JoinRoomModal.jsx         Find a room by ID and join it (public/passcode/approval)
     RoomAdminPanel.jsx        Manage members, promote/demote, approve requests
+    CallPanel.jsx            Audio/video calls (WebRTC signaling over Supabase)
     PasswordInput.jsx          Reusable show/hide password field
     MessageBubble.jsx        Single message UI
   context/
-    AuthContext.jsx           Firebase auth state + actions
+    AuthContext.jsx           Supabase auth state + actions
   lib/
-    firebase.js               Firebase app/auth/db init
+    supabase.js               Supabase browser client
+    mappers.js                snake_case row -> camelCase UI shape helpers
     hash.js                    SHA-256 helper for passcodes (Web Crypto API)
+    systemAdmin.js             System admin email + helper
+supabase/
+  schema.sql                 Full database schema, RLS, RPCs, realtime, storage
 ```
 
 ## How room privacy works
@@ -223,7 +152,7 @@ an `admins` array and a `members` array (the creator starts in both).
 - **Public** — anyone signed in can join with one click, from the sidebar's
   "Discover public rooms" list or by pasting the ID into "Join by ID."
 - **Passcode** — the creator sets a code when creating the room. Joiners paste
-  the room ID into "Join by ID," then enter the code.
+  the room ID into "Join by ID," then enter the code (verified server-side).
 - **Admin approval** — joiners paste the room ID, send a request, and wait.
   Admins see pending requests in the room's "Manage" panel and approve or deny.
 
@@ -236,14 +165,3 @@ Anyone can **leave** a room at any time from the **Leave** button in the room
 header. If you're the room's only admin and other members are still in it,
 you'll be asked to promote someone first so the room doesn't end up
 unmanaged. If you're the last person in the room, leaving deletes it.
-
-## Extending it
-
-- **A real cross-app friends list**: this build treats "who's in a room" as
-  per-room membership managed by that room's admin. A separate global friends
-  system (friend requests, a persistent contacts list, "invite a friend" from
-  any room) would be its own `friends/{uid}/list` collection plus its own UI.
-- **Typing indicators**: write a `typing/{uid}` doc per room with a timestamp, debounce on keypress, and clear it after a few seconds of inactivity.
-- **Read receipts**: store `lastReadAt` per user per room and compare against message timestamps.
-- **File/image sharing**: add Firebase Storage, upload on file select, and store the resulting URL on the message doc.
-- **Server-verified passcodes**: move the passcode check into a Cloud Function for the airtight version described in the security note above.

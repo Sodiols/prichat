@@ -1,18 +1,10 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
-import {
-  collection,
-  onSnapshot,
-  query,
-  where,
-  updateDoc,
-  doc,
-  arrayUnion,
-} from "firebase/firestore";
-import { db } from "@/lib/firebase";
+import { supabase } from "@/lib/supabase";
+import { mapRoom } from "@/lib/mappers";
 import { useAuth } from "@/context/AuthContext";
 import { useSidebar } from "@/context/SidebarContext";
 import { isSystemAdminEmail } from "@/lib/systemAdmin";
@@ -37,71 +29,51 @@ export default function Sidebar() {
 
   const isSystemAdmin = isSystemAdminEmail(user?.email);
 
+  const loadRooms = useCallback(async () => {
+    if (!user) return;
+
+    const { data: allRooms, error } = await supabase
+      .from("rooms")
+      .select("*")
+      .order("created_at", { ascending: true });
+
+    if (error) {
+      setPrivateRoomError(isSystemAdmin ? "Couldn't load private rooms." : "");
+      return;
+    }
+
+    const rooms = (allRooms || []).map(mapRoom);
+
+    setMyRooms(
+      rooms.filter((r) => r.members.includes(user.uid) || r.admins.includes(user.uid))
+    );
+    setPublicRooms(rooms.filter((r) => r.privacy === "public"));
+    setPrivateRooms(
+      isSystemAdmin ? rooms.filter((r) => ["passcode", "approval"].includes(r.privacy)) : []
+    );
+    setPrivateRoomError("");
+  }, [user, isSystemAdmin]);
+
   useEffect(() => {
     if (!user) return undefined;
 
-    let memberRooms = [];
-    let adminRooms = [];
+    loadRooms();
 
-    const syncRooms = () => {
-      const byId = new Map();
-      [...memberRooms, ...adminRooms].forEach((room) => byId.set(room.id, room));
-      const rooms = Array.from(byId.values());
-      rooms.sort((a, b) => (a.createdAt?.seconds || 0) - (b.createdAt?.seconds || 0));
-      setMyRooms(rooms);
-    };
-
-    const memberQuery = query(collection(db, "rooms"), where("members", "array-contains", user.uid));
-    const adminQuery = query(collection(db, "rooms"), where("admins", "array-contains", user.uid));
-
-    const unsubMembers = onSnapshot(memberQuery, (snap) => {
-      memberRooms = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-      syncRooms();
-    });
-
-    const unsubAdmins = onSnapshot(adminQuery, (snap) => {
-      adminRooms = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-      syncRooms();
-    });
+    // Rooms are readable by any signed-in user, so a single table subscription
+    // keeps every list (mine / public / private) in sync.
+    const channel = supabase
+      .channel("sidebar-rooms")
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "rooms" },
+        () => loadRooms()
+      )
+      .subscribe();
 
     return () => {
-      unsubMembers();
-      unsubAdmins();
+      supabase.removeChannel(channel);
     };
-  }, [user]);
-
-  useEffect(() => {
-    const q = query(collection(db, "rooms"), where("privacy", "==", "public"));
-    const unsub = onSnapshot(q, (snap) => {
-      const rooms = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-      rooms.sort((a, b) => (a.createdAt?.seconds || 0) - (b.createdAt?.seconds || 0));
-      setPublicRooms(rooms);
-    });
-    return () => unsub();
-  }, []);
-
-  useEffect(() => {
-    if (!isSystemAdmin) {
-      setPrivateRooms([]);
-      return undefined;
-    }
-
-    const q = query(collection(db, "rooms"), where("privacy", "in", ["passcode", "approval"]));
-    const unsub = onSnapshot(
-      q,
-      (snap) => {
-        const rooms = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-        rooms.sort((a, b) => (a.createdAt?.seconds || 0) - (b.createdAt?.seconds || 0));
-        setPrivateRooms(rooms);
-        setPrivateRoomError("");
-      },
-      () => {
-        setPrivateRoomError("Couldn't load private rooms.");
-      }
-    );
-
-    return () => unsub();
-  }, [isSystemAdmin]);
+  }, [user, loadRooms]);
 
   const notYetJoinedPublicRooms = publicRooms.filter(
     (r) => !r.members?.includes(user?.uid) && !r.admins?.includes(user?.uid)
@@ -113,7 +85,7 @@ export default function Sidebar() {
   };
 
   const handleQuickJoin = async (roomId) => {
-    await updateDoc(doc(db, "rooms", roomId), { members: arrayUnion(user.uid) });
+    await supabase.rpc("join_room", { p_room_id: roomId, p_passcode_hash: null });
     closeMobile();
     router.push(`/chat/${roomId}`);
   };
@@ -134,16 +106,16 @@ export default function Sidebar() {
     setJoiningPrivateRoom(`${room.id}-${mode}`);
 
     try {
-      if (mode === "admin") {
-        await updateDoc(doc(db, "rooms", room.id), { admins: arrayUnion(user.uid) });
-      } else {
-        await updateDoc(doc(db, "rooms", room.id), { members: arrayUnion(user.uid) });
-      }
+      const { error } =
+        mode === "admin"
+          ? await supabase.rpc("join_room_as_admin", { p_room_id: room.id })
+          : await supabase.rpc("join_room", { p_room_id: room.id, p_passcode_hash: null });
+      if (error) throw error;
 
       closeMobile();
       router.push(`/chat/${room.id}`);
     } catch (error) {
-      setPrivateRoomError("Couldn't join this private room. Check Firestore rules.");
+      setPrivateRoomError("Couldn't join this private room. Try again.");
     } finally {
       setJoiningPrivateRoom("");
     }
@@ -157,13 +129,13 @@ export default function Sidebar() {
         }`}
       >
         <div className="flex items-center justify-between gap-2 px-5 py-5 border-b border-border shrink-0">
-          <div className="flex items-center gap-2 min-w-0">
+          <div className="flex items-center min-w-0 gap-2">
             <PriChatMark />
-            <span className="font-display font-semibold text-lg tracking-tight truncate">PriChat</span>
+            <span className="text-lg font-semibold tracking-tight truncate font-display">PriChat</span>
           </div>
           <button
             onClick={closeMobile}
-            className="md:hidden text-textSecondary hover:text-textPrimary p-1 shrink-0"
+            className="p-1 md:hidden text-textSecondary hover:text-textPrimary shrink-0"
             aria-label="Close rooms menu"
           >
             <CloseIcon />
@@ -187,9 +159,9 @@ export default function Sidebar() {
           </button>
         </div>
 
-        <nav className="flex-1 overflow-y-auto px-2 mt-2 space-y-4">
+        <nav className="flex-1 px-2 mt-2 space-y-4 overflow-y-auto">
           <div>
-            <p className="px-3 pt-2 pb-1 text-xs uppercase tracking-wider text-textSecondary">
+            <p className="px-3 pt-2 pb-1 text-xs tracking-wider uppercase text-textSecondary">
               Your rooms
             </p>
             {myRooms.length === 0 && (
@@ -219,7 +191,7 @@ export default function Sidebar() {
 
           {isSystemAdmin && (
             <div>
-              <p className="px-3 pt-2 pb-1 text-xs uppercase tracking-wider text-textSecondary">
+              <p className="px-3 pt-2 pb-1 text-xs tracking-wider uppercase text-textSecondary">
                 Private rooms
               </p>
               {privateRoomError && <p className="px-3 py-1 text-xs text-red-400">{privateRoomError}</p>}
@@ -242,7 +214,7 @@ export default function Sidebar() {
                       }`}
                     >
                       <div className="flex items-center gap-1.5 min-w-0 mb-2">
-                        <span className="truncate text-sm font-medium"># {room.name}</span>
+                        <span className="text-sm font-medium truncate"># {room.name}</span>
                         <LockIcon />
                       </div>
                       <div className="flex items-center justify-between gap-2">
@@ -277,7 +249,7 @@ export default function Sidebar() {
 
           {notYetJoinedPublicRooms.length > 0 && (
             <div>
-              <p className="px-3 pt-2 pb-1 text-xs uppercase tracking-wider text-textSecondary">
+              <p className="px-3 pt-2 pb-1 text-xs tracking-wider uppercase text-textSecondary">
                 Discover public rooms
               </p>
               <div className="space-y-0.5">
@@ -289,7 +261,7 @@ export default function Sidebar() {
                     <span className="truncate"># {room.name}</span>
                     <button
                       onClick={() => handleQuickJoin(room.id)}
-                      className="text-accent text-xs hover:underline shrink-0"
+                      className="text-xs text-accent hover:underline shrink-0"
                     >
                       Join
                     </button>
@@ -301,7 +273,7 @@ export default function Sidebar() {
         </nav>
 
         <div
-          className="border-t border-border px-4 py-4 shrink-0"
+          className="px-4 py-4 border-t border-border shrink-0"
           style={{ paddingBottom: "max(1rem, env(safe-area-inset-bottom))" }}
         >
           <div className="flex items-center gap-3">
@@ -316,15 +288,14 @@ export default function Sidebar() {
               title="Edit profile"
             >
               <p className="text-sm font-medium truncate hover:text-accent">{user?.displayName || user?.email}</p>
-              <p className="text-xs text-textSecondary truncate">Edit profile</p>
+              <p className="text-xs truncate text-textSecondary">Edit profile</p>
             </button>
             <button
               type="button"
               onClick={handleLogout}
-              className="text-textSecondary hover:text-textPrimary text-xs"
-              title="Log out"
+              className="text-xs text-[#f75835] px-2 py-3 transition-all duration-200 rounded-md shrink-0 border-r-2 border-transparent hover:border-[#f75835]/75 hover:bg-red-500/10"
             >
-              Exit
+              Sign out
             </button>
           </div>
         </div>
@@ -335,7 +306,7 @@ export default function Sidebar() {
       {showProfile && <ProfileModal onClose={() => setShowProfile(false)} />}
 
       {mobileOpen && (
-        <div className="fixed inset-0 bg-black/50 z-10 md:hidden" onClick={closeMobile} />
+        <div className="fixed inset-0 z-10 bg-black/50 md:hidden" onClick={closeMobile} />
       )}
     </>
   );

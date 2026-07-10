@@ -2,8 +2,7 @@
 
 import { useState } from "react";
 import { useRouter } from "next/navigation";
-import { collection, addDoc, serverTimestamp } from "firebase/firestore";
-import { db } from "@/lib/firebase";
+import { supabase } from "@/lib/supabase";
 import { useAuth } from "@/context/AuthContext";
 import { sha256Hex } from "@/lib/hash";
 import PasswordInput from "@/components/PasswordInput";
@@ -51,17 +50,21 @@ export default function CreateRoomModal({ onClose }) {
     setError("");
     try {
       const passcodeHash = privacy === "passcode" ? await sha256Hex(passcode.trim()) : null;
-      const ref = await addDoc(collection(db, "rooms"), {
-        name: trimmed,
-        privacy,
-        passcodeHash,
-        createdBy: user.uid,
-        createdAt: serverTimestamp(),
-        admins: [user.uid],
-        members: [user.uid],
-      });
+      const { data, error: insertError } = await supabase
+        .from("rooms")
+        .insert({
+          name: trimmed,
+          privacy,
+          passcode_hash: passcodeHash,
+          created_by: user.uid,
+          admins: [user.uid],
+          members: [user.uid],
+        })
+        .select("id")
+        .single();
+      if (insertError) throw insertError;
       onClose();
-      router.push(`/chat/${ref.id}`);
+      router.push(`/chat/${data.id}`);
     } catch (err) {
       setError("Couldn't create the room. Try again.");
     } finally {

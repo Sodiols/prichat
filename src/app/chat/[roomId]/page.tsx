@@ -2,21 +2,8 @@
 
 import { useEffect, useRef, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
-import {
-  collection,
-  addDoc,
-  query,
-  orderBy,
-  onSnapshot,
-  serverTimestamp,
-  doc,
-  limit,
-  updateDoc,
-  deleteDoc,
-  arrayRemove,
-} from "firebase/firestore";
-import { getDownloadURL, ref, uploadBytes } from "firebase/storage";
-import { db, storage } from "@/lib/firebase";
+import { supabase, VOICE_BUCKET } from "@/lib/supabase";
+import { mapMessage, mapRoom } from "@/lib/mappers";
 import { useAuth } from "@/context/AuthContext";
 import MessageBubble from "@/components/MessageBubble";
 import RoomAdminPanel from "@/components/RoomAdminPanel";
@@ -53,18 +40,13 @@ const EMOJI_OPTIONS = [
 ];
 
 function getSendErrorMessage(err) {
-  const code = err?.code || "";
   const message = err?.message || "";
 
-  if (code.includes("storage/unauthorized") || code.includes("storage/unauthenticated")) {
-    return "Voice upload was blocked by Firebase Storage rules. Upload the latest storage.rules file.";
+  if (/row-level security|permission|not authorized|policy/i.test(message)) {
+    return "That action was blocked by Supabase security policies. Make sure the schema.sql policies are applied.";
   }
 
-  if (code.includes("permission-denied")) {
-    return "Message sending was blocked by Firestore rules. Upload the latest firestore.rules file.";
-  }
-
-  return message || "Message could not be sent. Check Firebase Firestore and Storage rules.";
+  return message || "Message could not be sent. Please try again.";
 }
 
 function cleanReply(message) {
@@ -128,29 +110,60 @@ export default function RoomPage() {
   const [showLeaveConfirm, setShowLeaveConfirm] = useState(false);
   const [leaving, setLeaving] = useState(false);
   const [leaveError, setLeaveError] = useState("");
-  const bottomRef = useRef(null);
-  const inputRef = useRef(null);
-  const mediaRecorderRef = useRef(null);
-  const voiceChunksRef = useRef([]);
-  const voiceStreamRef = useRef(null);
-  const recordingTimerRef = useRef(null);
+  const bottomRef = useRef<HTMLDivElement | null>(null);
+  const inputRef = useRef<HTMLTextAreaElement | null>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const voiceChunksRef = useRef<Blob[]>([]);
+  const voiceStreamRef = useRef<MediaStream | null>(null);
+  const recordingTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const recordingSecondsRef = useRef(0);
   const recordingCancelledRef = useRef(false);
 
   useEffect(() => {
-    const unsub = onSnapshot(
-      doc(db, "rooms", roomId),
-      (snap) => {
-        if (!snap.exists()) {
-          setRoomState("not-found");
-          return;
+    let active = true;
+
+    const loadRoom = async () => {
+      const { data, error } = await supabase
+        .from("rooms")
+        .select("*")
+        .eq("id", roomId)
+        .maybeSingle();
+      if (!active) return;
+      if (error) {
+        setRoomState("denied");
+        return;
+      }
+      if (!data) {
+        setRoomState("not-found");
+        return;
+      }
+      setRoom(mapRoom(data));
+      setRoomState("ok");
+    };
+
+    loadRoom();
+
+    const channel = supabase
+      .channel(`room:${roomId}`)
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "rooms", filter: `id=eq.${roomId}` },
+        (payload) => {
+          if (payload.eventType === "DELETE") {
+            setRoomState("not-found");
+            setRoom(null);
+            return;
+          }
+          setRoom(mapRoom(payload.new));
+          setRoomState("ok");
         }
-        setRoom({ id: snap.id, ...snap.data() });
-        setRoomState("ok");
-      },
-      () => setRoomState("denied")
-    );
-    return () => unsub();
+      )
+      .subscribe();
+
+    return () => {
+      active = false;
+      supabase.removeChannel(channel);
+    };
   }, [roomId]);
 
   const isMember = !!room?.members?.includes(user?.uid);
@@ -160,16 +173,47 @@ export default function RoomPage() {
   const isReady = roomState === "ok" && hasRoomAccess;
 
   useEffect(() => {
-    if (!isReady) return;
-    const q = query(
-      collection(db, "rooms", roomId, "messages"),
-      orderBy("createdAt", "asc"),
-      limit(200)
-    );
-    const unsub = onSnapshot(q, (snap) => {
-      setMessages(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
-    });
-    return () => unsub();
+    if (!isReady) return undefined;
+    let active = true;
+
+    const loadMessages = async () => {
+      const { data } = await supabase
+        .from("messages")
+        .select("*")
+        .eq("room_id", roomId)
+        .order("created_at", { ascending: true })
+        .limit(200);
+      if (active) setMessages((data || []).map(mapMessage));
+    };
+
+    loadMessages();
+
+    const channel = supabase
+      .channel(`messages:${roomId}`)
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "messages", filter: `room_id=eq.${roomId}` },
+        (payload) => {
+          setMessages((current) => {
+            if (payload.eventType === "DELETE") {
+              return current.filter((m) => m.id !== payload.old.id);
+            }
+            const mapped = mapMessage(payload.new);
+            const exists = current.some((m) => m.id === mapped.id);
+            const next = exists
+              ? current.map((m) => (m.id === mapped.id ? mapped : m))
+              : [...current, mapped];
+            next.sort((a, b) => (a.createdAt?.getTime() || 0) - (b.createdAt?.getTime() || 0));
+            return next;
+          });
+        }
+      )
+      .subscribe();
+
+    return () => {
+      active = false;
+      supabase.removeChannel(channel);
+    };
   }, [roomId, isReady]);
 
   useEffect(() => {
@@ -195,20 +239,21 @@ export default function RoomPage() {
     setError("");
 
     try {
-      const messageData = {
+      const messageData: Record<string, any> = {
+        room_id: roomId,
         text: trimmed,
         type: "text",
         uid: user.uid,
-        displayName: user.displayName || user.email,
-        photoURL: user.photoURL || null,
-        createdAt: serverTimestamp(),
+        display_name: user.displayName || user.email,
+        photo_url: user.photoURL || null,
       };
 
       if (replyTo) {
-        messageData.replyTo = cleanReply(replyTo);
+        messageData.reply_to = cleanReply(replyTo);
       }
 
-      await addDoc(collection(db, "rooms", roomId, "messages"), messageData);
+      const { error: insertError } = await supabase.from("messages").insert(messageData);
+      if (insertError) throw insertError;
       setText("");
       setReplyTo(null);
     } catch (err) {
@@ -231,30 +276,35 @@ export default function RoomPage() {
     const extension = getVoiceExtension(contentType);
     const fileName = `voice-${Date.now()}.${extension}`;
     const filePath = `rooms/${roomId}/uploads/${user.uid}-${fileName}`;
-    const storageRef = ref(storage, filePath);
 
-    await uploadBytes(storageRef, blob, { contentType });
-    const mediaUrl = await getDownloadURL(storageRef);
+    const { error: uploadError } = await supabase.storage
+      .from(VOICE_BUCKET)
+      .upload(filePath, blob, { contentType, upsert: true });
+    if (uploadError) throw uploadError;
 
-    const messageData = {
+    const { data: publicData } = supabase.storage.from(VOICE_BUCKET).getPublicUrl(filePath);
+    const mediaUrl = publicData.publicUrl;
+
+    const messageData: Record<string, any> = {
+      room_id: roomId,
       text: "Voice message",
       type: "voice",
-      mediaUrl,
-      fileName,
-      fileMimeType: contentType,
-      fileSize: blob.size,
-      durationSeconds,
+      media_url: mediaUrl,
+      file_name: fileName,
+      file_mime_type: contentType,
+      file_size: blob.size,
+      duration_seconds: durationSeconds,
       uid: user.uid,
-      displayName: user.displayName || user.email,
-      photoURL: user.photoURL || null,
-      createdAt: serverTimestamp(),
+      display_name: user.displayName || user.email,
+      photo_url: user.photoURL || null,
     };
 
     if (replyTo) {
-      messageData.replyTo = cleanReply(replyTo);
+      messageData.reply_to = cleanReply(replyTo);
     }
 
-    await addDoc(collection(db, "rooms", roomId, "messages"), messageData);
+    const { error: insertError } = await supabase.from("messages").insert(messageData);
+    if (insertError) throw insertError;
     setReplyTo(null);
   };
 
@@ -383,14 +433,15 @@ export default function RoomPage() {
 
     setSavingEdit(true);
     try {
-      await updateDoc(doc(db, "rooms", roomId, "messages", editingMessage.id), {
-        text: trimmed,
-        editedAt: serverTimestamp(),
-      });
+      const { error: updateError } = await supabase
+        .from("messages")
+        .update({ text: trimmed, edited_at: new Date().toISOString() })
+        .eq("id", editingMessage.id);
+      if (updateError) throw updateError;
       setEditingMessage(null);
       setEditText("");
     } catch {
-      alert("Couldn't edit this message. Check your Firestore rules and try again.");
+      alert("Couldn't edit this message. Please try again.");
     } finally {
       setSavingEdit(false);
     }
@@ -416,10 +467,15 @@ export default function RoomPage() {
     setDeletingMessageId(deleteTarget.id);
     setDeleteError("");
     try {
-      await deleteDoc(doc(db, "rooms", roomId, "messages", deleteTarget.id));
+      const { error: deleteErr } = await supabase
+        .from("messages")
+        .delete()
+        .eq("id", deleteTarget.id);
+      if (deleteErr) throw deleteErr;
+      setMessages((current) => current.filter((m) => m.id !== deleteTarget.id));
       setDeleteTarget(null);
     } catch {
-      setDeleteError("Couldn't delete this message. Check your Firestore rules and try again.");
+      setDeleteError("Couldn't delete this message. Please try again.");
     } finally {
       setDeletingMessageId("");
     }
@@ -441,16 +497,9 @@ export default function RoomPage() {
         return;
       }
 
-      if (remaining.length === 0) {
-        await deleteDoc(doc(db, "rooms", room.id));
-      } else if (isAdmin) {
-        await updateDoc(doc(db, "rooms", room.id), {
-          members: arrayRemove(user.uid),
-          admins: arrayRemove(user.uid),
-        });
-      } else {
-        await updateDoc(doc(db, "rooms", room.id), { members: arrayRemove(user.uid) });
-      }
+      // leave_room handles removing the caller and deleting an empty room.
+      const { error: rpcError } = await supabase.rpc("leave_room", { p_room_id: room.id });
+      if (rpcError) throw rpcError;
       router.push("/chat");
     } catch (err) {
       setLeaveError("Couldn't leave the room. Try again.");

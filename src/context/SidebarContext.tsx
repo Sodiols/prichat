@@ -1,10 +1,16 @@
 "use client";
 
-import { createContext, useContext, useState } from "react";
+import { createContext, useContext, useState, type ReactNode } from "react";
 
-const SidebarContext = createContext(null);
+interface SidebarContextValue {
+  mobileOpen: boolean;
+  openMobile: () => void;
+  closeMobile: () => void;
+}
 
-export function SidebarProvider({ children }) {
+const SidebarContext = createContext<SidebarContextValue | null>(null);
+
+export function SidebarProvider({ children }: { children: ReactNode }) {
   const [mobileOpen, setMobileOpen] = useState(false);
 
   return (
@@ -20,7 +26,7 @@ export function SidebarProvider({ children }) {
   );
 }
 
-export function useSidebar() {
+export function useSidebar(): SidebarContextValue {
   const ctx = useContext(SidebarContext);
   if (!ctx) throw new Error("useSidebar must be used within a SidebarProvider");
   return ctx;

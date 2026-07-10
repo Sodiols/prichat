@@ -5,17 +5,26 @@ import { useRouter } from "next/navigation";
 import { useAuth } from "@/context/AuthContext";
 import PasswordInput from "@/components/PasswordInput";
 
-function friendlyError(code) {
-  const map = {
-    "auth/invalid-email": "That email doesn't look right.",
-    "auth/user-not-found": "No account with that email.",
-    "auth/wrong-password": "Incorrect password.",
-    "auth/email-already-in-use": "An account already exists for that email.",
-    "auth/weak-password": "Password should be at least 6 characters.",
-    "auth/invalid-credential": "Email or password is incorrect.",
-    "auth/popup-closed-by-user": "Google sign-in was closed before finishing.",
-  };
-  return map[code] || "Something went wrong. Try again.";
+function friendlyError(err) {
+  if (err?.code === "custom/name-required") return "Tell us what to call you.";
+
+  const message = (err?.message || "").toLowerCase();
+  if (message.includes("already registered") || message.includes("already been registered")) {
+    return "An account already exists for that email.";
+  }
+  if (message.includes("invalid login credentials") || message.includes("invalid credentials")) {
+    return "Email or password is incorrect.";
+  }
+  if (message.includes("password should be") || message.includes("weak password")) {
+    return "Password should be at least 6 characters.";
+  }
+  if (message.includes("email not confirmed")) {
+    return "Please confirm your email, then sign in.";
+  }
+  if (message.includes("unable to validate email") || message.includes("invalid email")) {
+    return "That email doesn't look right.";
+  }
+  return err?.message || "Something went wrong. Try again.";
 }
 
 export default function LoginPage() {
@@ -41,9 +50,7 @@ export default function LoginPage() {
       }
       router.replace("/chat");
     } catch (err) {
-      setError(
-        err.code === "custom/name-required" ? "Tell us what to call you." : friendlyError(err.code)
-      );
+      setError(friendlyError(err));
     } finally {
       setLoading(false);
     }
@@ -53,11 +60,10 @@ export default function LoginPage() {
     setError("");
     setLoading(true);
     try {
+      // Redirects to Google; the /chat redirect happens after the callback.
       await loginWithGoogle();
-      router.replace("/chat");
     } catch (err) {
-      setError(friendlyError(err.code));
-    } finally {
+      setError(friendlyError(err));
       setLoading(false);
     }
   };

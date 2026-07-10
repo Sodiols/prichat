@@ -1,8 +1,14 @@
 /* eslint-disable @next/next/no-img-element */
 "use client";
 
-export default function UserAvatar({ name, photoURL, size = "md" }) {
-  const classes = {
+interface UserAvatarProps {
+  name?: string | null;
+  photoURL?: string | null;
+  size?: "sm" | "md" | "lg";
+}
+
+export default function UserAvatar({ name, photoURL, size = "md" }: UserAvatarProps) {
+  const classes: Record<string, string> = {
     sm: "h-7 w-7 text-xs",
     md: "h-9 w-9 text-sm",
     lg: "h-12 w-12 text-base",

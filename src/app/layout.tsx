@@ -3,7 +3,7 @@ import { AuthProvider } from "@/context/AuthContext";
 
 export const metadata = {
   title: "PriChat — Realtime Chat",
-  description: "A realtime multi-user chat app built with Next.js and Firebase.",
+  description: "A realtime multi-user chat app built with Next.js and Supabase.",
 };
 
 export const viewport = {

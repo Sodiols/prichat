@@ -4,8 +4,10 @@
 import UserAvatar from "./UserAvatar";
 
 function formatTime(message) {
-  return message.createdAt?.toDate
-    ? message.createdAt.toDate().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+  const value = message.createdAt;
+  const date = value instanceof Date ? value : value ? new Date(value) : null;
+  return date && !Number.isNaN(date.getTime())
+    ? date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
     : "sending…";
 }
 
