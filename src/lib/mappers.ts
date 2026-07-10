@@ -20,6 +20,7 @@ export function mapProfile(row: Row | null | undefined): Profile | null {
   return {
     id: row.id,
     uid: row.id,
+    username: row.username || null,
     displayName: row.display_name || "Member",
     email: row.email || null,
     photoURL: row.photo_url || null,
@@ -58,6 +59,9 @@ export function mapMessage(row: Row | null | undefined): Message | null {
     fileSize: row.file_size || null,
     durationSeconds: row.duration_seconds || null,
     replyTo: row.reply_to || null,
+    metadata: row.metadata || {},
+    mentionedUsernames: row.mentioned_usernames || [],
+    mentionedAll: !!row.mentioned_all,
     createdAt: toDate(row.created_at),
     editedAt: toDate(row.edited_at),
   };

@@ -21,6 +21,14 @@ function toPlainDescription(description) {
   return description ? { type: description.type, sdp: description.sdp } : null;
 }
 
+function formatCallDuration(seconds) {
+  if (!Number.isFinite(seconds) || seconds < 1) return "less than a minute";
+  const minutes = Math.floor(seconds / 60);
+  const rest = seconds % 60;
+  if (minutes < 1) return `${rest}s`;
+  return rest ? `${minutes}m ${rest}s` : `${minutes}m`;
+}
+
 export default function CallPanel({ roomId, room, user, isAdmin, isSystemAdmin }) {
   const [activeCall, setActiveCall] = useState<any>(null);
   const [participants, setParticipants] = useState<any[]>([]);
@@ -50,6 +58,7 @@ export default function CallPanel({ roomId, room, user, isAdmin, isSystemAdmin }
   const userId = user?.uid || "";
   const userName = user?.displayName || user?.email || "Member";
   const userPhotoURL = user?.photoURL || null;
+  const userHandle = user?.username || userName;
 
   const visibleParticipants = useMemo(
     () => participants.filter((p) => !p.hidden && !p.leftAt),
@@ -63,6 +72,56 @@ export default function CallPanel({ roomId, room, user, isAdmin, isSystemAdmin }
   const joinedParticipant = participants.find((p) => p.uid === userId && !p.leftAt);
   const isCallCreator = activeCall?.createdBy === userId;
   const canEndForEveryone = !!activeCall && (isCallCreator || isAdmin || isSystemAdmin);
+
+  const insertCallEvent = useCallback(
+    async (text, eventType, options: any = {}) => {
+      await supabase
+        .rpc("insert_room_event", {
+          p_room_id: roomId,
+          p_text: text,
+          p_event_type: eventType,
+          p_target_uid: options.targetUid || null,
+          p_call_id: options.callId || activeCallRef.current?.id || null,
+          p_duration_seconds: options.durationSeconds || null,
+          p_actor_uid: options.actorUid || null,
+        })
+        .then(() => {});
+    },
+    [roomId]
+  );
+
+  const writeCallEndEvents = useCallback(
+    async (call) => {
+      if (!call) return;
+      const createdAt = call.createdAt instanceof Date ? call.createdAt : new Date(call.createdAt || Date.now());
+      const durationSeconds = Math.max(0, Math.round((Date.now() - createdAt.getTime()) / 1000));
+      const pickedUids = new Set(
+        participants
+          .filter((participant) => !participant.hidden)
+          .map((participant) => participant.uid)
+      );
+      const missedUids = (room?.members || []).filter(
+        (uid) => uid !== call.createdBy && !pickedUids.has(uid)
+      );
+
+      await insertCallEvent(
+        `${call.createdByName || "Someone"}'s ${call.type} call ended after ${formatCallDuration(durationSeconds)}`,
+        "call_ended",
+        { callId: call.id, durationSeconds, actorUid: call.createdBy }
+      );
+
+      await Promise.all(
+        missedUids.map((uid) =>
+          insertCallEvent(
+            `You missed a ${call.type} call from ${call.createdByName || "Member"}`,
+            "call_missed",
+            { callId: call.id, targetUid: uid, actorUid: call.createdBy }
+          )
+        )
+      );
+    },
+    [insertCallEvent, participants, room?.members]
+  );
 
   useEffect(() => {
     let active = true;
@@ -193,7 +252,9 @@ export default function CallPanel({ roomId, room, user, isAdmin, isSystemAdmin }
     setScreenSharing(false);
   }, []);
 
-  const closeCallIfEmpty = useCallback(async (callId) => {
+  const closeCallIfEmpty = useCallback(async (call) => {
+    const callId = call?.id;
+    if (!callId) return;
     const { count, error: countError } = await supabase
       .from("call_participants")
       .select("uid", { count: "exact", head: true })
@@ -201,11 +262,11 @@ export default function CallPanel({ roomId, room, user, isAdmin, isSystemAdmin }
       .is("left_at", null);
     if (countError || count !== 0) return;
 
-    await supabase
+    const ended = await supabase
       .rpc("end_call_if_empty", { p_call_id: callId })
-      .then(async ({ error: rpcError }) => {
-        if (!rpcError) return;
-        await supabase
+      .then(async ({ data, error: rpcError }) => {
+        if (!rpcError) return !!data;
+        const { error: fallbackError } = await supabase
           .from("calls")
           .update({
             status: "ended",
@@ -215,9 +276,11 @@ export default function CallPanel({ roomId, room, user, isAdmin, isSystemAdmin }
           })
           .eq("id", callId)
           .eq("status", "active")
-          .then(() => {});
+          .then((result) => result);
+        return !fallbackError;
       });
-  }, [userId]);
+    if (ended) await writeCallEndEvents(call);
+  }, [writeCallEndEvents, userId]);
 
   const leaveCurrentCall = useCallback(
     async ({ markLeft = true } = {}) => {
@@ -242,7 +305,7 @@ export default function CallPanel({ roomId, room, user, isAdmin, isSystemAdmin }
           .eq("call_id", call.id)
           .eq("uid", userId)
           .then(() => {});
-        await closeCallIfEmpty(call.id);
+        await closeCallIfEmpty(call);
       }
     },
     [cleanupPeers, closeCallIfEmpty, stopLocalMedia, userId]
@@ -492,7 +555,7 @@ export default function CallPanel({ roomId, room, user, isAdmin, isSystemAdmin }
         {
           call_id: call.id,
           uid: userId,
-          display_name: userName,
+          display_name: userHandle,
           photo_url: userPhotoURL,
           hidden,
           role: hidden ? "admin" : "normal",
@@ -535,7 +598,7 @@ export default function CallPanel({ roomId, room, user, isAdmin, isSystemAdmin }
           type,
           status: "active",
           created_by: userId,
-          created_by_name: userName,
+          created_by_name: userHandle,
         })
         .select()
         .single();
@@ -544,6 +607,11 @@ export default function CallPanel({ roomId, room, user, isAdmin, isSystemAdmin }
       const call = mapCall(data);
       activeCallRef.current = call;
       setActiveCall(call);
+      await insertCallEvent(
+        `${userHandle} started a ${type} call`,
+        "call_started",
+        { callId: call.id, actorUid: userId }
+      );
       await joinCall(call, "normal", { ignoreJoining: true });
     } catch {
       setError("Couldn't start the call. Please check your browser permissions and try again.");
@@ -638,6 +706,7 @@ export default function CallPanel({ roomId, room, user, isAdmin, isSystemAdmin }
 
   const endForEveryone = async () => {
     if (!activeCall || !canEndForEveryone) return;
+    const call = activeCall;
     await supabase
       .from("calls")
       .update({
@@ -648,6 +717,7 @@ export default function CallPanel({ roomId, room, user, isAdmin, isSystemAdmin }
       })
       .eq("id", activeCall.id)
       .then(() => {});
+    await writeCallEndEvents(call);
     await leaveCurrentCall({ markLeft: true });
   };
 

@@ -19,6 +19,8 @@ export const metadata: Metadata = {
   keywords: [
     "PriChat",
     "secret messaging app",
+    "private chat website",
+    "Private chatting app",
     "private messaging",
     "realtime chat",
     "private chat rooms",
@@ -102,6 +104,7 @@ const jsonLd = {
   featureList: [
     "Realtime messaging",
     "Public, passcode and admin-approval rooms",
+    "Secure and private communication",
     "Voice messages",
     "Audio and video calls",
     "Message replies, editing and deletion",

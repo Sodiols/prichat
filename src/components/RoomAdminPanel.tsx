@@ -23,6 +23,18 @@ export default function RoomAdminPanel({ room, onClose }) {
   const isLastAdmin = room.admins.length <= 1;
 
   const updateRoom = (patch) => supabase.from("rooms").update(patch).eq("id", room.id);
+  const displayHandle = (profile) => profile?.username || profile?.displayName || "Member";
+
+  const insertRoomEvent = async (text, eventType, targetUid = null) => {
+    await supabase
+      .rpc("insert_room_event", {
+        p_room_id: room.id,
+        p_text: text,
+        p_event_type: eventType,
+        p_target_uid: targetUid,
+      })
+      .then(() => {});
+  };
 
   const memberKey = room.members.join(",");
 
@@ -80,6 +92,11 @@ export default function RoomAdminPanel({ room, onClose }) {
     setBusyUid(uid);
     try {
       await updateRoom({ admins: withValue(room.admins, uid) });
+      await insertRoomEvent(
+        `${displayHandle(profiles[uid])} was promoted to admin`,
+        "admin_promoted",
+        uid
+      );
     } finally {
       setBusyUid(null);
     }
@@ -109,6 +126,7 @@ export default function RoomAdminPanel({ room, onClose }) {
         members: withoutValue(room.members, uid),
         admins: withoutValue(room.admins, uid),
       });
+      await insertRoomEvent(`${displayHandle(profiles[uid])} left`, "room_left", uid);
     } finally {
       setBusyUid(null);
     }
@@ -166,7 +184,13 @@ export default function RoomAdminPanel({ room, onClose }) {
   const approve = async (uid) => {
     setBusyUid(uid);
     try {
+      const request = requests.find((r) => r.uid === uid);
       await updateRoom({ members: withValue(room.members, uid) });
+      await insertRoomEvent(
+        `${displayHandle(profiles[uid] || request)} joined`,
+        "room_joined",
+        uid
+      );
       await supabase.from("join_requests").delete().eq("room_id", room.id).eq("uid", uid);
     } finally {
       setBusyUid(null);

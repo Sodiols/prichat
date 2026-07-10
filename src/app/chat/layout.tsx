@@ -5,9 +5,10 @@ import { useRouter } from "next/navigation";
 import { useAuth } from "@/context/AuthContext";
 import { SidebarProvider } from "@/context/SidebarContext";
 import Sidebar from "@/components/Sidebar";
+import UsernameSetupModal from "@/components/UsernameSetupModal";
 
 export default function ChatLayout({ children }) {
-  const { user, loading } = useAuth();
+  const { user, profile, loading } = useAuth();
   const router = useRouter();
 
   useEffect(() => {
@@ -27,6 +28,7 @@ export default function ChatLayout({ children }) {
       <div className="flex h-dvh bg-bg overflow-hidden">
         <Sidebar />
         <main className="flex-1 flex flex-col min-w-0">{children}</main>
+        {profile && !profile.username && <UsernameSetupModal />}
       </div>
     </SidebarProvider>
   );

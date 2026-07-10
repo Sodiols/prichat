@@ -15,6 +15,7 @@ create extension if not exists "pgcrypto";
 create table if not exists public.profiles (
   id           uuid primary key references auth.users (id) on delete cascade,
   display_name text not null default 'Member',
+  username     text,
   email        text,
   photo_url    text,
   last_seen    timestamptz default now(),
@@ -37,7 +38,7 @@ create table if not exists public.messages (
   id               uuid primary key default gen_random_uuid(),
   room_id          uuid not null references public.rooms (id) on delete cascade,
   text             text not null default '',
-  type             text not null default 'text' check (type in ('text', 'image', 'video', 'voice')),
+  type             text not null default 'text' check (type in ('text', 'image', 'video', 'voice', 'system', 'call')),
   uid              uuid not null,
   display_name     text,
   photo_url        text,
@@ -47,10 +48,26 @@ create table if not exists public.messages (
   file_size        bigint,
   duration_seconds integer,
   reply_to         jsonb,
+  metadata         jsonb not null default '{}'::jsonb,
+  mentioned_usernames text[] not null default '{}',
+  mentioned_all    boolean not null default false,
   created_at       timestamptz default now(),
   edited_at        timestamptz
 );
 create index if not exists messages_room_created_idx on public.messages (room_id, created_at);
+
+alter table public.profiles add column if not exists username text;
+alter table public.messages add column if not exists metadata jsonb not null default '{}'::jsonb;
+alter table public.messages add column if not exists mentioned_usernames text[] not null default '{}';
+alter table public.messages add column if not exists mentioned_all boolean not null default false;
+alter table public.messages drop constraint if exists messages_type_check;
+alter table public.messages add constraint messages_type_check
+  check (type in ('text', 'image', 'video', 'voice', 'system', 'call'));
+create unique index if not exists profiles_username_unique_idx
+  on public.profiles (lower(username))
+  where username is not null;
+create index if not exists messages_mentions_idx
+  on public.messages using gin (mentioned_usernames);
 
 create table if not exists public.join_requests (
   room_id      uuid not null references public.rooms (id) on delete cascade,
@@ -160,6 +177,103 @@ as $$
   );
 $$;
 
+create or replace function public.normalize_username(p_username text)
+returns text
+language sql immutable
+as $$
+  select lower(regexp_replace(trim(coalesce(p_username, '')), '[^a-zA-Z0-9_]', '', 'g'));
+$$;
+
+create or replace function public.claim_username(p_username text)
+returns text
+language plpgsql security definer set search_path = public
+as $$
+declare
+  clean_username text;
+begin
+  if auth.uid() is null then
+    raise exception 'Not authenticated';
+  end if;
+
+  clean_username := public.normalize_username(p_username);
+
+  if clean_username !~ '^[a-z0-9_]{3,24}$' then
+    raise exception 'Username must be 3-24 characters and use letters, numbers, or underscores';
+  end if;
+
+  update public.profiles
+    set username = clean_username,
+        updated_at = now(),
+        last_seen = now()
+  where id = auth.uid();
+
+  if not found then
+    insert into public.profiles (id, username, display_name, email)
+    values (auth.uid(), clean_username, 'Member', auth.jwt() ->> 'email');
+  end if;
+
+  return clean_username;
+exception
+  when unique_violation then
+    raise exception 'Username is already taken';
+end;
+$$;
+
+create or replace function public.insert_room_event(
+  p_room_id uuid,
+  p_text text,
+  p_event_type text,
+  p_target_uid uuid default null,
+  p_call_id uuid default null,
+  p_duration_seconds integer default null,
+  p_actor_uid uuid default null
+)
+returns void
+language plpgsql security definer set search_path = public
+as $$
+declare
+  actor_id uuid;
+  actor_profile public.profiles;
+begin
+  if auth.uid() is null then
+    raise exception 'Not authenticated';
+  end if;
+
+  if not public.is_room_member(p_room_id) then
+    raise exception 'Not allowed';
+  end if;
+
+  actor_id := coalesce(p_actor_uid, auth.uid());
+  select * into actor_profile from public.profiles where id = actor_id;
+
+  insert into public.messages (
+    room_id,
+    text,
+    type,
+    uid,
+    display_name,
+    photo_url,
+    duration_seconds,
+    metadata
+  )
+  values (
+    p_room_id,
+    p_text,
+    case when p_event_type like 'call_%' then 'call' else 'system' end,
+    actor_id,
+    coalesce(actor_profile.username, actor_profile.display_name, 'Member'),
+    actor_profile.photo_url,
+    p_duration_seconds,
+    jsonb_strip_nulls(jsonb_build_object(
+      'eventType', p_event_type,
+      'targetUid', p_target_uid,
+      'callId', p_call_id,
+      'durationSeconds', p_duration_seconds
+    ))
+  );
+end;
+$$;
+
 create or replace function public.end_call_if_empty(p_call_id uuid)
 returns boolean
 language plpgsql security definer set search_path = public
@@ -207,6 +321,8 @@ language plpgsql security definer set search_path = public
 as $$
 declare
   r public.rooms;
+  p public.profiles;
+  was_member boolean := false;
 begin
   if auth.uid() is null then
     raise exception 'Not authenticated';
@@ -227,11 +343,22 @@ begin
     end if;
   end if;
 
+  was_member := auth.uid() = any (r.members);
+
   update public.rooms
     set members = (
       select array(select distinct unnest(members || auth.uid()))
     )
   where id = p_room_id;
+
+  if not was_member then
+    select * into p from public.profiles where id = auth.uid();
+    perform public.insert_room_event(
+      p_room_id,
+      format('%s joined', coalesce(p.username, p.display_name, 'Member')),
+      'room_joined'
+    );
+  end if;
 end;
 $$;
 
@@ -240,14 +367,45 @@ create or replace function public.join_room_as_admin(p_room_id uuid)
 returns void
 language plpgsql security definer set search_path = public
 as $$
+declare
+  r public.rooms;
+  p public.profiles;
+  was_member boolean := false;
+  was_admin boolean := false;
 begin
   if not public.is_system_admin() then
     raise exception 'Only the system admin can join as admin';
   end if;
 
+  select * into r from public.rooms where id = p_room_id;
+  if not found then
+    raise exception 'Room not found';
+  end if;
+
+  was_member := auth.uid() = any (r.members);
+  was_admin := auth.uid() = any (r.admins);
+
   update public.rooms
-    set admins = (select array(select distinct unnest(admins || auth.uid())))
+    set admins = (select array(select distinct unnest(admins || auth.uid()))),
+        members = (select array(select distinct unnest(members || auth.uid())))
   where id = p_room_id;
+
+  select * into p from public.profiles where id = auth.uid();
+  if not was_member then
+    perform public.insert_room_event(
+      p_room_id,
+      format('%s joined', coalesce(p.username, p.display_name, 'Member')),
+      'room_joined'
+    );
+  end if;
+  if not was_admin then
+    perform public.insert_room_event(
+      p_room_id,
+      format('%s was promoted to admin', coalesce(p.username, p.display_name, 'Member')),
+      'admin_promoted',
+      auth.uid()
+    );
+  end if;
 end;
 $$;
 
@@ -258,6 +416,7 @@ language plpgsql security definer set search_path = public
 as $$
 declare
   r public.rooms;
+  p public.profiles;
   remaining uuid[];
 begin
   if auth.uid() is null then
@@ -269,11 +428,19 @@ begin
     return;
   end if;
 
+  select * into p from public.profiles where id = auth.uid();
+
   remaining := array(select unnest(r.members) except select auth.uid());
 
   if array_length(remaining, 1) is null then
     delete from public.rooms where id = p_room_id;
   else
+    perform public.insert_room_event(
+      p_room_id,
+      format('%s left', coalesce(p.username, p.display_name, 'Member')),
+      'room_left'
+    );
+
     update public.rooms
       set members = remaining,
           admins  = array(select unnest(admins) except select auth.uid())
@@ -392,7 +559,11 @@ create policy messages_select on public.messages
 drop policy if exists messages_insert on public.messages;
 create policy messages_insert on public.messages
   for insert to authenticated
-  with check (uid = auth.uid() and public.is_room_member(room_id));
+  with check (
+    uid = auth.uid()
+    and public.is_room_member(room_id)
+    and type in ('text', 'image', 'video', 'voice')
+  );
 
 drop policy if exists messages_update on public.messages;
 create policy messages_update on public.messages

@@ -2,13 +2,14 @@
 // produced by the mappers in ./mappers.ts (not the raw Postgres rows).
 
 export type RoomPrivacy = "public" | "passcode" | "approval";
-export type MessageType = "text" | "image" | "video" | "voice";
+export type MessageType = "text" | "image" | "video" | "voice" | "system" | "call";
 export type CallType = "audio" | "video";
 export type CallStatus = "active" | "ended";
 
 export interface Profile {
   id: string;
   uid: string;
+  username: string | null;
   displayName: string;
   email: string | null;
   photoURL: string | null;
@@ -19,6 +20,7 @@ export interface Profile {
 export interface AppUser {
   uid: string;
   id: string;
+  username: string | null;
   email: string | null;
   displayName: string;
   photoURL: string | null;
@@ -59,6 +61,9 @@ export interface Message {
   fileSize: number | null;
   durationSeconds: number | null;
   replyTo: ReplyPreview | null;
+  metadata: Record<string, any>;
+  mentionedUsernames: string[];
+  mentionedAll: boolean;
   createdAt: Date | null;
   editedAt: Date | null;
 }
@@ -109,5 +114,6 @@ export interface AuthContextValue {
   login: (email: string, password: string) => Promise<void>;
   loginWithGoogle: () => Promise<void>;
   logout: () => Promise<unknown>;
-  updateMyProfile: (input: { displayName: string; photoURL?: string | null }) => Promise<void>;
+  claimUsername: (username: string) => Promise<string>;
+  updateMyProfile: (input: { displayName: string; username?: string | null; photoURL?: string | null }) => Promise<void>;
 }

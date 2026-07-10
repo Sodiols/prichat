@@ -1,9 +1,9 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import { supabase, VOICE_BUCKET } from "@/lib/supabase";
-import { mapMessage, mapRoom } from "@/lib/mappers";
+import { mapMessage, mapProfile, mapRoom } from "@/lib/mappers";
 import { useAuth } from "@/context/AuthContext";
 import MessageBubble from "@/components/MessageBubble";
 import RoomAdminPanel from "@/components/RoomAdminPanel";
@@ -62,6 +62,48 @@ function cleanReply(message) {
   };
 }
 
+function normalizeUsername(value) {
+  return value.trim().toLowerCase().replace(/[^a-z0-9_]/g, "");
+}
+
+function extractMentionData(text, profiles) {
+  const rawMatches = Array.from(text.matchAll(/@([a-zA-Z0-9_]+)/g)).map((match) =>
+    normalizeUsername(match[1])
+  );
+  const mentionedAll = rawMatches.includes("everyone");
+  const validNames = new Set(
+    profiles
+      .map((profile) => profile?.username)
+      .filter(Boolean)
+      .map((username) => username.toLowerCase())
+  );
+  const mentionedUsernames = Array.from(
+    new Set(rawMatches.filter((name) => name !== "everyone" && validNames.has(name)))
+  );
+  return { mentionedAll, mentionedUsernames };
+}
+
+function getMentionToken(value, cursor) {
+  const beforeCursor = value.slice(0, cursor);
+  const match = beforeCursor.match(/(^|\s)@([a-zA-Z0-9_]*)$/);
+  if (!match) return null;
+  return {
+    query: normalizeUsername(match[2] || ""),
+    start: beforeCursor.length - (match[2] || "").length - 1,
+    end: cursor,
+  };
+}
+
+async function showWebsiteNotification(title, body) {
+  if (typeof window === "undefined" || !("Notification" in window)) return;
+  if (Notification.permission === "default") {
+    await Notification.requestPermission().catch(() => "denied");
+  }
+  if (Notification.permission === "granted") {
+    new Notification(title, { body });
+  }
+}
+
 function getVoiceMimeType() {
   if (typeof MediaRecorder === "undefined") return "";
   const options = ["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus", "audio/mp4"];
@@ -93,7 +135,10 @@ export default function RoomPage() {
   const [room, setRoom] = useState(null);
   const [roomState, setRoomState] = useState("loading"); // loading | ok | not-found | denied
   const [messages, setMessages] = useState([]);
+  const [memberProfiles, setMemberProfiles] = useState([]);
   const [text, setText] = useState("");
+  const [mentionToken, setMentionToken] = useState(null);
+  const [mentionToast, setMentionToast] = useState(null);
   const [replyTo, setReplyTo] = useState(null);
   const [error, setError] = useState("");
   const [sending, setSending] = useState(false);
@@ -171,6 +216,39 @@ export default function RoomPage() {
   const isSystemAdmin = isSystemAdminEmail(user?.email);
   const hasRoomAccess = isMember || isAdmin || isSystemAdmin;
   const isReady = roomState === "ok" && hasRoomAccess;
+  const memberKey = room?.members?.join(",") || "";
+
+  const visibleMessages = useMemo(
+    () =>
+      messages.filter((message) => {
+        if (message.metadata?.eventType !== "call_missed") return true;
+        return !message.metadata?.targetUid || message.metadata.targetUid === user?.uid;
+      }),
+    [messages, user?.uid]
+  );
+
+  const mentionSuggestions = useMemo(() => {
+    if (!mentionToken) return [];
+    const query = mentionToken.query;
+    const users = memberProfiles
+      .filter((profile) => profile?.username)
+      .filter((profile) => {
+        if (profile.uid === user?.uid) return false;
+        return !query || profile.username.toLowerCase().startsWith(query);
+      })
+      .slice(0, 6)
+      .map((profile) => ({
+        type: "user",
+        label: `@${profile.username}`,
+        value: profile.username,
+        subtitle: profile.displayName,
+      }));
+    const everyone =
+      "everyone".startsWith(query) || query === ""
+        ? [{ type: "everyone", label: "@everyone", value: "everyone", subtitle: "Notify everyone in this room" }]
+        : [];
+    return [...everyone, ...users];
+  }, [memberProfiles, mentionToken, user?.uid]);
 
   useEffect(() => {
     if (!isReady) return undefined;
@@ -194,11 +272,25 @@ export default function RoomPage() {
         "postgres_changes",
         { event: "*", schema: "public", table: "messages", filter: `room_id=eq.${roomId}` },
         (payload) => {
+          const mapped = payload.eventType === "DELETE" ? null : mapMessage(payload.new);
+          if (
+            payload.eventType === "INSERT" &&
+            mapped &&
+            mapped.uid !== user?.uid &&
+            user?.username &&
+            (mapped.mentionedAll || mapped.mentionedUsernames?.includes(user.username.toLowerCase()))
+          ) {
+            const title = `${mapped.displayName || "Someone"} mentioned you`;
+            const body = `#${room?.name || "PriChat"}: ${mapped.text || "Open the room"}`;
+            setMentionToast({ title, body });
+            window.setTimeout(() => setMentionToast(null), 5000);
+            showWebsiteNotification(title, body);
+          }
+
           setMessages((current) => {
             if (payload.eventType === "DELETE") {
               return current.filter((m) => m.id !== payload.old.id);
             }
-            const mapped = mapMessage(payload.new);
             const exists = current.some((m) => m.id === mapped.id);
             const next = exists
               ? current.map((m) => (m.id === mapped.id ? mapped : m))
@@ -214,7 +306,39 @@ export default function RoomPage() {
       active = false;
       supabase.removeChannel(channel);
     };
-  }, [roomId, isReady]);
+  }, [roomId, isReady, room?.name, user?.uid, user?.username]);
+
+  useEffect(() => {
+    const memberIds = memberKey ? memberKey.split(",") : [];
+    if (!isReady || !memberIds.length) {
+      setMemberProfiles([]);
+      return undefined;
+    }
+
+    let active = true;
+    const loadProfiles = async () => {
+      const { data } = await supabase
+        .from("profiles")
+        .select("*")
+        .in("id", memberIds);
+      if (active) setMemberProfiles((data || []).map(mapProfile).filter(Boolean));
+    };
+
+    loadProfiles();
+    const channel = supabase
+      .channel(`room-profiles:${roomId}`)
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "profiles" },
+        () => loadProfiles()
+      )
+      .subscribe();
+
+    return () => {
+      active = false;
+      supabase.removeChannel(channel);
+    };
+  }, [isReady, memberKey, roomId]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -239,13 +363,16 @@ export default function RoomPage() {
     setError("");
 
     try {
+      const mentionData = extractMentionData(trimmed, memberProfiles);
       const messageData: Record<string, any> = {
         room_id: roomId,
         text: trimmed,
         type: "text",
         uid: user.uid,
-        display_name: user.displayName || user.email,
+        display_name: user.username || user.displayName || user.email,
         photo_url: user.photoURL || null,
+        mentioned_usernames: mentionData.mentionedUsernames,
+        mentioned_all: mentionData.mentionedAll,
       };
 
       if (replyTo) {
@@ -255,6 +382,7 @@ export default function RoomPage() {
       const { error: insertError } = await supabase.from("messages").insert(messageData);
       if (insertError) throw insertError;
       setText("");
+      setMentionToken(null);
       setReplyTo(null);
     } catch (err) {
       console.error("Message send failed:", err);
@@ -267,6 +395,30 @@ export default function RoomPage() {
   const handleEmojiSelect = (emoji) => {
     setText((current) => `${current}${emoji}`);
     inputRef.current?.focus();
+  };
+
+  const refreshMentionToken = () => {
+    const cursor = inputRef.current?.selectionStart ?? text.length;
+    setMentionToken(getMentionToken(text, cursor));
+  };
+
+  const handleTextChange = (e) => {
+    const next = e.target.value;
+    const cursor = e.target.selectionStart ?? next.length;
+    setText(next);
+    setMentionToken(getMentionToken(next, cursor));
+  };
+
+  const selectMention = (value) => {
+    if (!mentionToken) return;
+    const next = `${text.slice(0, mentionToken.start)}@${value} ${text.slice(mentionToken.end)}`;
+    const nextCursor = mentionToken.start + value.length + 2;
+    setText(next);
+    setMentionToken(null);
+    requestAnimationFrame(() => {
+      inputRef.current?.focus();
+      inputRef.current?.setSelectionRange(nextCursor, nextCursor);
+    });
   };
 
   const sendVoiceMessage = async (blob, mimeType, durationSeconds) => {
@@ -295,7 +447,7 @@ export default function RoomPage() {
       file_size: blob.size,
       duration_seconds: durationSeconds,
       uid: user.uid,
-      display_name: user.displayName || user.email,
+      display_name: user.username || user.displayName || user.email,
       photo_url: user.photoURL || null,
     };
 
@@ -605,14 +757,21 @@ export default function RoomPage() {
 
       {isReady && (
         <>
+          {mentionToast && (
+            <div className="pointer-events-none fixed right-3 top-24 z-30 w-[min(22rem,calc(100vw-1.5rem))] rounded-2xl border border-accent/35 bg-surface px-4 py-3 shadow-2xl shadow-black/30">
+              <p className="text-sm font-semibold text-textPrimary">{mentionToast.title}</p>
+              <p className="mt-1 line-clamp-2 text-xs text-textSecondary">{mentionToast.body}</p>
+            </div>
+          )}
+
           <div className="flex-1 overflow-y-auto px-3 py-4 sm:px-5 lg:px-8">
             <div className="flex w-full flex-col gap-3">
-              {messages.length === 0 && (
+              {visibleMessages.length === 0 && (
                 <p className="mx-auto mt-10 rounded-full border border-border bg-surface px-4 py-2 text-center text-sm text-textSecondary">
                   No messages yet. Say something.
                 </p>
               )}
-              {messages.map((m) => {
+              {visibleMessages.map((m) => {
                 const isMessageOwner = m.uid === user.uid;
                 const canEditOrDeleteMessage = isSystemAdmin || isMessageOwner;
 
@@ -622,7 +781,7 @@ export default function RoomPage() {
                     message={m}
                     isOwn={isMessageOwner}
                     canEdit={canEditOrDeleteMessage && m.type === "text"}
-                    canDelete={canEditOrDeleteMessage}
+                    canDelete={canEditOrDeleteMessage && !["system", "call"].includes(m.type)}
                     onReply={handleReplyMessage}
                     onEdit={handleStartEditMessage}
                     onDelete={handleDeleteMessage}
@@ -704,6 +863,33 @@ export default function RoomPage() {
 
               {error && <p className="mb-2 px-2 text-xs text-red-400">{error}</p>}
 
+              {mentionSuggestions.length > 0 && (
+                <div className="absolute bottom-[4.75rem] left-16 z-20 w-[min(18rem,calc(100vw-5rem))] overflow-hidden rounded-2xl border border-border bg-surface shadow-2xl shadow-black/30 sm:bottom-[4.25rem] sm:left-20">
+                  {mentionSuggestions.map((suggestion) => (
+                    <button
+                      key={`${suggestion.type}-${suggestion.value}`}
+                      type="button"
+                      onClick={() => selectMention(suggestion.value)}
+                      className="flex w-full items-center justify-between gap-3 px-3 py-2.5 text-left transition hover:bg-surfaceHover"
+                    >
+                      <span className="min-w-0">
+                        <span className="block truncate text-sm font-medium text-textPrimary">
+                          {suggestion.label}
+                        </span>
+                        <span className="block truncate text-xs text-textSecondary">
+                          {suggestion.subtitle}
+                        </span>
+                      </span>
+                      {suggestion.type === "everyone" && (
+                        <span className="rounded-full border border-accent/30 px-2 py-0.5 text-[10px] uppercase tracking-wider text-accent">
+                          all
+                        </span>
+                      )}
+                    </button>
+                  ))}
+                </div>
+              )}
+
               <div className="flex items-end gap-2">
 
 
@@ -737,7 +923,9 @@ export default function RoomPage() {
                   <textarea
                     ref={inputRef}
                     value={text}
-                    onChange={(e) => setText(e.target.value)}
+                    onChange={handleTextChange}
+                    onKeyUp={refreshMentionToken}
+                    onClick={refreshMentionToken}
                     placeholder="Message"
                     disabled={voiceState !== "idle"}
                     rows={1}

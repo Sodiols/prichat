@@ -278,7 +278,7 @@ export default function Sidebar() {
         >
           <div className="flex items-center gap-3">
             <div className="relative shrink-0">
-              <UserAvatar name={user?.displayName || user?.email} photoURL={user?.photoURL} size="md" />
+              <UserAvatar name={user?.username || user?.displayName || user?.email} photoURL={user?.photoURL} size="md" />
               <span className="absolute -bottom-0.5 -right-0.5 h-2.5 w-2.5 rounded-full bg-accent ring-2 ring-surface animate-pulse-slow" />
             </div>
             <button
@@ -288,7 +288,7 @@ export default function Sidebar() {
               title="Edit profile"
             >
               <p className="text-sm font-medium truncate hover:text-accent">{user?.displayName || user?.email}</p>
-              <p className="text-xs truncate text-textSecondary">Edit profile</p>
+              <p className="text-xs truncate text-textSecondary">{user?.username ? `@${user.username}` : "Edit profile"}</p>
             </button>
             <button
               type="button"

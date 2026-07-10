@@ -132,6 +132,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     return {
       uid: authUser.id,
       id: authUser.id,
+      username: profile?.username || null,
       email: authUser.email ?? null,
       displayName: profile?.displayName || nameFromAuthUser(authUser),
       photoURL: profile?.photoURL || (authUser.user_metadata?.avatar_url as string) || null,
@@ -158,15 +159,28 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     return data.user;
   };
 
+  const claimUsername = async (username: string) => {
+    const { data, error } = await supabase.rpc("claim_username", { p_username: username });
+    if (error) throw error;
+    return data as string;
+  };
+
   const updateMyProfile = async ({
     displayName,
+    username,
     photoURL,
   }: {
     displayName: string;
+    username?: string | null;
     photoURL?: string | null;
   }) => {
     if (!authUser) throw new Error("Not signed in");
     const cleanName = displayName?.trim() || "Member";
+    const cleanUsername = username === undefined ? undefined : username?.trim().toLowerCase() || null;
+
+    if (cleanUsername && cleanUsername !== profile?.username) {
+      await claimUsername(cleanUsername);
+    }
 
     const { error } = await supabase
       .from("profiles")
@@ -203,7 +217,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   return (
     <AuthContext.Provider
-      value={{ user, profile, loading, signup, login, loginWithGoogle, logout, updateMyProfile }}
+      value={{ user, profile, loading, signup, login, loginWithGoogle, logout, claimUsername, updateMyProfile }}
     >
       {children}
     </AuthContext.Provider>

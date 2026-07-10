@@ -12,6 +12,14 @@ function formatTime(message) {
     : "sending…";
 }
 
+function formatDuration(seconds) {
+  if (!Number.isFinite(seconds) || seconds < 1) return "";
+  const minutes = Math.floor(seconds / 60);
+  const rest = seconds % 60;
+  if (minutes < 1) return `${rest}s`;
+  return rest ? `${minutes}m ${rest}s` : `${minutes}m`;
+}
+
 function previewText(message) {
   if (!message) return "";
   if (message.type === "image") return message.text || "Photo";
@@ -34,6 +42,24 @@ export default function MessageBubble({
   const wasEdited = !!message.editedAt;
   const senderName = isOwn ? "You" : message.displayName || "Member";
   const hasMedia = !!message.mediaUrl && ["image", "video", "voice"].includes(message.type);
+
+  if (message.type === "system" || message.type === "call") {
+    const eventType = message.metadata?.eventType || "";
+    const duration = formatDuration(message.durationSeconds || message.metadata?.durationSeconds || 0);
+    return (
+      <div className="flex w-full justify-center px-2 py-1">
+        <div className="max-w-[92%] rounded-full border border-border bg-surface/80 px-3 py-1.5 text-center text-xs text-textSecondary shadow-sm">
+          <span className={message.type === "call" ? "text-accent" : "text-textPrimary"}>
+            {message.text}
+          </span>
+          {duration && eventType === "call_ended" && (
+            <span className="ml-1 text-textSecondary">({duration})</span>
+          )}
+          <span className="ml-2 text-[10px] text-textSecondary/80">{time}</span>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className={`group flex w-full items-end gap-2 ${isOwn ? "justify-end" : "justify-start"}`}>

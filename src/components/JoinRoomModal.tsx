@@ -143,7 +143,7 @@ export default function JoinRoomModal({ onClose }) {
         {
           room_id: room.id,
           uid: user.uid,
-          display_name: user.displayName || user.email,
+          display_name: user.username || user.displayName || user.email,
           photo_url: user.photoURL || null,
         },
         { onConflict: "room_id,uid" }
